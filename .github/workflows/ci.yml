@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: ['*']
+  pull_request:
+
+jobs:
+
+  # ---------- Linux (Debian-based) ----------
+  linux-debian:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        perl: ['5.20', '5.28', '5.36', '5.40']
+    name: Debian - Perl ${{ matrix.perl }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libssl-dev zlib1g-dev liblz4-dev pkg-config
+
+      - name: Install ClickHouse
+        run: |
+          sudo apt-get install -y -qq apt-transport-https ca-certificates curl gnupg
+          curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" | sudo tee /etc/apt/sources.list.d/clickhouse.list
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clickhouse-server clickhouse-client
+          sudo clickhouse-server --daemon
+          for i in $(seq 1 30); do clickhouse-client --query "SELECT 1" 2>/dev/null && break || sleep 1; done
+
+      - name: Install Perl dependencies
+        run: cpanm -n EV
+
+      - name: Build
+        run: perl Makefile.PL && make
+
+      - name: Test
+        run: make test
+        env:
+          TEST_CLICKHOUSE_HOST: 127.0.0.1
+          TEST_CLICKHOUSE_PORT: 8123
+          TEST_CLICKHOUSE_NATIVE_PORT: 9000
+
+  # ---------- Linux (Alpine / musl) ----------
+  linux-alpine:
+    runs-on: ubuntu-latest
+    name: Alpine (musl)
+    container:
+      image: alpine:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          apk add --no-cache perl perl-dev perl-app-cpanminus make gcc musl-dev \
+            openssl-dev zlib-dev lz4-dev pkgconf wget bash curl
+
+      - name: Install ClickHouse
+        run: |
+          curl https://clickhouse.com/ | sh
+          ./clickhouse server --daemon
+          for i in $(seq 1 30); do ./clickhouse client --query "SELECT 1" 2>/dev/null && break || sleep 1; done
+
+      - name: Install Perl dependencies
+        run: cpanm -n EV
+
+      - name: Build
+        run: perl Makefile.PL && make
+
+      - name: Test
+        run: make test
+        env:
+          TEST_CLICKHOUSE_HOST: 127.0.0.1
+          TEST_CLICKHOUSE_PORT: 8123
+          TEST_CLICKHOUSE_NATIVE_PORT: 9000
+
+  # ---------- FreeBSD ----------
+  freebsd:
+    runs-on: ubuntu-latest
+    name: FreeBSD
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y perl5 p5-EV openssl liblz4 pkgconf gmake bash curl
+          run: |
+            # Install ClickHouse static binary (install script needs bash)
+            curl -fsSL https://clickhouse.com/ | bash -s -- -y
+            ./clickhouse server --daemon
+            for i in $(seq 1 30); do ./clickhouse client --query "SELECT 1" 2>/dev/null && break || sleep 1; done
+
+            export TEST_CLICKHOUSE_HOST=127.0.0.1
+            export TEST_CLICKHOUSE_PORT=8123
+            export TEST_CLICKHOUSE_NATIVE_PORT=9000
+
+            perl Makefile.PL && gmake && gmake test
+
+  # ---------- macOS ----------
+  macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        perl: ['5.28', '5.40']
+    name: macOS - Perl ${{ matrix.perl }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl }}
+
+      - name: Install system dependencies
+        run: brew install openssl@3 lz4 pkg-config
+
+      - name: Install ClickHouse
+        run: |
+          curl https://clickhouse.com/ | sh
+          ./clickhouse server --daemon
+          for i in $(seq 1 30); do ./clickhouse client --query "SELECT 1" 2>/dev/null && break || sleep 1; done
+
+      - name: Install Perl dependencies
+        run: cpanm -n EV
+
+      - name: Build
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:$PKG_CONFIG_PATH"
+          perl Makefile.PL && make
+
+      - name: Test
+        run: make test
+        env:
+          TEST_CLICKHOUSE_HOST: 127.0.0.1
+          TEST_CLICKHOUSE_PORT: 8123
+          TEST_CLICKHOUSE_NATIVE_PORT: 9000
