@@ -1,0 +1,14 @@
+/CLAUDE.md
+/Makefile
+/MYMETA.*
+/META.*
+/ClickHouse.c
+/ClickHouse.o
+/ClickHouse.bs
+/pm_to_blib
+/blib/
+/.build/
+/Makefile.old
+/EV-ClickHouse-*
+/MANIFEST.bak
+/t_debug_compress.pl

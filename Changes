@@ -1,0 +1,30 @@
+0.03  2026-05-21
+    - Multi-host failover and connection Pool (circuit breaker, hedged
+      queries, fan-out, sessions); async DNS; TLS mutual auth.
+    - retry, wait_mutation, native external tables, idempotent and
+      async/aggregated insert, Streamer backpressure.
+    - More introspection helpers, the EV::ClickHouse::Error class, and
+      new types (BFloat16, Decimal256, Interval, Geo, JSON).
+    - Reliability and memory-safety fixes; docs and tests.
+
+0.02  2026-04-30
+    - Bug fixes: keepalive PING/PONG routing; last_error_code reports
+      top-level code; IPv6 URI literals; skip_pending teardown.
+    - HTTP arrayref insert() croaks on nested refs.
+    - POD rewrite; expanded t/, xt/, eg/.
+
+0.01  2026-03-15
+    - Initial release.
+    - HTTP (8123) + native (9000, rev 54459) protocols.
+    - TLS via OpenSSL; LZ4 native compression; gzip HTTP compression.
+    - URI parsing; per-query + connection settings; parameterized
+      queries; auto-reconnect; drain / cancel / skip_pending.
+    - Native types: Int8..256, UInt8..256, Float32/64, Bool, String,
+      FixedString, Date/Date32/DateTime/DateTime64 (with tz),
+      Decimal32/64/128, Enum8/16, UUID, IPv4/6, Nullable, Array,
+      Tuple, Map, LowCardinality, SimpleAggregateFunction, Nested,
+      Nothing.
+    - Accessors: column_names, column_types, last_error_code,
+      last_totals, last_extremes, profile_rows / bytes /
+      rows_before_limit, server_info / version / timezone,
+      is_connected, pending_count.
