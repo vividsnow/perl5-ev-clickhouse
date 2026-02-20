@@ -1,0 +1,38 @@
+0.03  2026-05-19
+    - Multi-host failover, Pool with circuit breaker, async DNS.
+    - TLS mutual auth, idempotent insert, async/aggregated insert.
+    - on_query_start / on_log / on_failover, track_query_durations.
+    - Pool::query_to / insert_to / nominate / hedged_query / with_each
+      / fan_out / with_session.
+    - retry($sql) with is_retryable_error gating + exponential backoff.
+    - ping_round_trip, Streamer::await_drain.
+    - slow_query_log, server_setting, row_count, table_size, ddl,
+      dictionary_reload, refresh_view; parse_uri class method.
+    - kill_query, cancel_by_query_id, bind_ident, for_json_paths.
+    - EV::ClickHouse::Error class.
+    - New types: BFloat16, Decimal256, Interval*, Geo, JSON.
+    - Reliability + memory-safety fixes around reset-in-callback and
+      teardown; bounded HTTP summary parser; Variant/Dynamic hard-fail.
+    - Docs + tests.
+
+0.02  2026-04-30
+    - Bug fixes: keepalive PING/PONG routing; last_error_code reports
+      top-level code; IPv6 URI literals; skip_pending teardown.
+    - HTTP arrayref insert() croaks on nested refs.
+    - POD rewrite; expanded t/, xt/, eg/.
+
+0.01  2026-03-15
+    - Initial release.
+    - HTTP (8123) + native (9000, rev 54459) protocols.
+    - TLS via OpenSSL; LZ4 native compression; gzip HTTP compression.
+    - URI parsing; per-query + connection settings; parameterized
+      queries; auto-reconnect; drain / cancel / skip_pending.
+    - Native types: Int8..256, UInt8..256, Float32/64, Bool, String,
+      FixedString, Date/Date32/DateTime/DateTime64 (with tz),
+      Decimal32/64/128, Enum8/16, UUID, IPv4/6, Nullable, Array,
+      Tuple, Map, LowCardinality, SimpleAggregateFunction, Nested,
+      Nothing.
+    - Accessors: column_names, column_types, last_error_code,
+      last_totals, last_extremes, profile_rows / bytes /
+      rows_before_limit, server_info / version / timezone,
+      is_connected, pending_count.
