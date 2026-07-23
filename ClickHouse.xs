@@ -204,7 +204,6 @@ struct ev_clickhouse_s {
     ev_timer ka_timer;      /* keepalive timer */
     double keepalive;       /* keepalive interval (0 = disabled) */
     int ka_timing;
-    unsigned int ka_in_flight; /* keepalive pings sent but not yet ack'd */
     int callback_depth;
     /* error info from last SERVER_EXCEPTION or HTTP error */
     int32_t last_error_code;
@@ -879,7 +878,6 @@ static int cleanup_connection(ev_clickhouse_t *self) {
     self->send_pos = 0;
     self->recv_len = 0;
     self->send_count = 0;
-    self->ka_in_flight = 0;
     self->pending_addendum_finish = 0;
     self->native_state = NATIVE_IDLE;
     CLEAR_SV(self->native_rows);
@@ -1064,7 +1062,8 @@ static void nbuf_grow(native_buf_t *b, size_t need) {
 
 static void nbuf_append(native_buf_t *b, const char *data, size_t len) {
     nbuf_grow(b, len);
-    memcpy(b->data + b->len, data, len);
+    /* len==0 with data==NULL is memcpy(dst, NULL, 0) — strict UB */
+    if (len) memcpy(b->data + b->len, data, len);
     b->len += len;
 }
 
@@ -1230,6 +1229,7 @@ static int is_client_only_key(const char *key, I32 klen) {
         || (klen == 13 && memcmp(key, "query_timeout", 13) == 0)
         || (klen == 6 && memcmp(key, "params", 6) == 0)
         || (klen == 8 && memcmp(key, "external", 8) == 0)
+        || (klen == 10 && memcmp(key, "idempotent", 10) == 0)
         || (klen == 17 && memcmp(key, "on_query_complete", 17) == 0);
 }
 
