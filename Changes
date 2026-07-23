@@ -5,6 +5,8 @@
     - Bound JSON variant slots, type nesting depth and Decimal/DateTime64
       scale from untrusted server input
     - Route the native keepalive ping through the send queue
+    - Decode chunked HTTP bodies incrementally instead of re-decoding the
+      whole body on every read (was quadratic on large responses)
 
 0.05  2026-06-02
     - Fix use-after-free when a callback clears its own handler

@@ -146,6 +146,11 @@ struct ev_clickhouse_s {
     size_t send_len, send_pos, send_cap;
     char *recv_buf;
     size_t recv_len, recv_cap;
+    char *http_decoded;         /* chunked body accumulated so far (NULL = none) */
+    size_t http_decoded_len;
+    size_t http_decoded_cap;
+    size_t http_chunk_off;      /* offset into recv_buf of next unparsed chunk hdr */
+    int http_chunk_active;      /* 1 = a partially decoded chunked body is held */
 
     /* native protocol state */
     char *server_name;
@@ -314,6 +319,7 @@ static int  pipeline_advance(ev_clickhouse_t *self);
     CLEAR_STR((self)->server_timezone); \
     CLEAR_STR((self)->insert_err); \
     CLEAR_STR((self)->recv_buf); \
+    CLEAR_STR((self)->http_decoded); \
     CLEAR_STR((self)->send_buf); \
     CLEAR_SV((self)->native_rows); \
     CLEAR_SV((self)->native_col_names); \
@@ -877,6 +883,12 @@ static int cleanup_connection(ev_clickhouse_t *self) {
     self->send_len = 0;
     self->send_pos = 0;
     self->recv_len = 0;
+    if (self->http_decoded) Safefree(self->http_decoded);
+    self->http_decoded = NULL;
+    self->http_decoded_len = 0;
+    self->http_decoded_cap = 0;
+    self->http_chunk_off = 0;
+    self->http_chunk_active = 0;
     self->send_count = 0;
     self->pending_addendum_finish = 0;
     self->native_state = NATIVE_IDLE;
