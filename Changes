@@ -1,3 +1,8 @@
+0.08  2026-11-18
+    - Fix nested LowCardinality; tz-less DateTime text uses the session/server timezone, not UTC.
+    - Insert: enum labels, exponent decimals, IPv4 in IPv6; data_format, columns_at, defaults.
+    - Faster arrayref inserts; errors name row and value; no early timeouts after blocking work.
+
 0.07  2026-10-16
     - Fix connection teardown, reconnect queues and callback lifetimes.
     - Cancel native INSERTs before sending data; validate date and numeric inputs.

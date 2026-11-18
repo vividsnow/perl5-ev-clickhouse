@@ -129,6 +129,14 @@ t/61_review_loop_r3.t
 t/62_review_loop_r4.t
 t/63_review_loop_r5.t
 t/64_review_loop_r7.t
+t/66_coercions.t
+t/67_lowcard_nested.t
+t/68_session_tz_timers.t
+t/69_data_format.t
+t/70_insert_defaults.t
+t/71_insert_projection.t
+t/72_insert_error_context.t
+t/73_review_fixes.t
 typemap
 xs/codecs.c
 xs/io.c

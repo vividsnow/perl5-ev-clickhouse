@@ -316,10 +316,9 @@ mixes up responses - connect after forking instead.
     packet leaves the byte stream unresyncable, so the connection is torn
     down and re-established rather than risk misattributing the server's
     remaining output to the next query). Mid-query I/O errors (ECONNRESET /
-    EPIPE) and a malformed native ServerHello are **not** retried - they
-    typically indicate a misconfigured peer or client-side bug that retry
-    would only loop on. Combine with `reconnect_max_attempts` for an
-    explicit ceiling.
+    EPIPE) also reconnect; the failed in-flight query receives an error.
+    A malformed native ServerHello is not retried. Combine with
+    `reconnect_max_attempts` for an explicit ceiling.
 
 - settings => \\%hash
 
@@ -393,8 +392,9 @@ to `0`, which returns raw numeric forms for stable round-tripping.
 
     Return `Date`, `Date32`, `DateTime`, and `DateTime64` as formatted
     strings (e.g. `"2024-01-15"`, `"2024-01-15 10:30:00"`) instead of raw
-    integers. Uses UTC; columns with an explicit timezone
-    (`DateTime('America/New_York')`) are converted to that zone.
+    integers, in the column's timezone (`DateTime('America/New_York')`),
+    else the `session_timezone` setting, else the server's timezone: the
+    same wall time the server prints.
 
 - decode\_decimal => 0 | 1
 
@@ -543,6 +543,11 @@ where a digit belongs, a value outside the column type's range, or
 encoding error instead of landing as a wrapped or zero value.
 Decimal and integer parsing matches the server's TSV verdicts
 (surplus fraction digits truncate; anything else malformed fails).
+The error names the column, the row (the 0-based index into `$data`,
+or the 1-based line of TabSeparated text) and the offending value or
+nested element, e.g. `column 'b' (UInt8), row 2: invalid value 'x'`.
+A value whose stringification dies (an overloaded object, a tied
+scalar) fails the batch the same way, with the exception text.
 
 Nested arrayrefs (Array/Tuple columns) and hashrefs (Map columns) are
 supported **only on the native protocol**, where the encoder has the
@@ -557,8 +562,8 @@ protocol or pre-serialise nested types into ClickHouse TSV literal form.
     ], sub { ... });
 
 The optional `\%settings` hashref works exactly as in ["query"](#query),
-including `query_id`, `query_timeout`, and `params`. Two extra
-flags are recognised here:
+including `query_id`, `query_timeout`, and `params`. Extra
+options recognised here:
 
 - `idempotent => 1 | $token`
 
@@ -571,6 +576,49 @@ flags are recognised here:
     Enables ClickHouse server-side insert batching by setting
     `async_insert=1, wait_for_async_insert=0`. Both sub-settings can be
     overridden by passing them explicitly.
+
+- `empty_as_default => 1`
+
+    Native protocol only. Empty top-level values (`undef` and `''`) fall
+    back to the column `DEFAULT` when the default expression is a constant
+    literal, or to the type default (`0`, `''`, `[]`, epoch zero, zero
+    UUID, ...) when no `DEFAULT` is declared. `undef` in `Nullable`
+    columns stays `NULL`. Non-literal defaults (`now()`, column
+    references, function calls) and `MATERIALIZED`/`ALIAS`/`EPHEMERAL`
+    columns named in the insert fail the batch; use
+    `data_format => 'Native'` with `input_format_null_as_default`
+    (see below) for server-side defaults instead. Off by default; without
+    it `undef` outside `Nullable` columns fails the batch as before.
+
+- `defaults => \%hash`
+
+    Native protocol only. Per-column overrides: `{ col => $value }`
+    replaces empty values in that column with `$value` (`''` always,
+    `undef` unless the column is `Nullable`), whatever the table
+    `DEFAULT` is. Implies `empty_as_default` for the named columns only.
+
+- `data_format => $format`
+
+    `$data` is one string already in ClickHouse input format `$format`
+    (`Native`, `CSV`, `JSONEachRow`, `Parquet`, ...), parsed by the
+    server as is. On the native protocol it travels inline with the query
+    in one round trip, so `compress` does not apply to it. A `Native`
+    block from [ClickHouse::Encoder](https://metacpan.org/pod/ClickHouse%3A%3AEncoder) declaring `Nullable(T)` columns,
+    with `input_format_null_as_default => 1`, makes the server fill
+    the column `DEFAULT` for each NULL:
+
+        $ch->insert('t (a, b)', $enc->encode(\@rows),
+            { data_format => 'Native', input_format_null_as_default => 1 },
+            sub { my (undef, $err) = @_; ... });
+
+- `columns_at => \@positions`
+
+    With arrayref data, column `j` of the insert reads
+    `$row->[$positions[j]]`, so wider records need no per-row copy.
+    Positions past the end of a row read as `undef`. The number of
+    positions must match the insert's columns.
+
+        $ch->insert('t (a, b, c)', \@records, { columns_at => [7, 2, 11] }, $cb);
 
 ## ping
 
@@ -1713,7 +1761,9 @@ round-trip stable raw values by default; opt into string forms via
 
     Default: integer (days since epoch / Unix seconds). With `decode_datetime`:
     `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS` or `YYYY-MM-DD HH:MM:SS.ffffff`.
-    DateTime carries a timezone string; the formatted output uses it.
+    Encode accepts the same integers or text. Text and formatted output are
+    wall time in the column's timezone, else the `session_timezone`
+    setting, else the server's timezone, as the server reads and prints it.
 
 - Time / Time64
 

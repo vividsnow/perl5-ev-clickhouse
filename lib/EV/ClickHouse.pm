@@ -11,7 +11,7 @@ my $RE_IDENT = qr/\A[A-Za-z_][A-Za-z0-9_]*\z/;
 my $RE_TABLE = qr/\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?\z/;
 
 BEGIN {
-    our $VERSION = '0.07';
+    our $VERSION = '0.08';
     use XSLoader;
     XSLoader::load __PACKAGE__, $VERSION;
 }
@@ -449,7 +449,11 @@ sub kill_query {
     my $mode = delete($opts{async}) ? 'async' : 'sync';
     die "kill_query: unknown option(s): " . join(', ', sort keys %opts) . "\n"
         if %opts;
-    $self->query("kill query where query_id = '$query_id' $mode", $cb);
+    # Newer servers fail with Code 785 "No query to kill" where older ones return no rows.
+    $self->query("kill query where query_id = '$query_id' $mode", sub {
+        return $cb->(undef) if defined $_[1] && $_[1] =~ /\bCode: 785\b/;
+        $cb->(@_);
+    });
 }
 
 # Per-connection latency tracking. EV::ClickHouse is a blessed scalar
@@ -692,6 +696,7 @@ sub is_healthy {
     die "Usage: \$ch->is_healthy(\$cb, [\$timeout])" unless ref($cb) eq 'CODE';
     $timeout //= 5;
     my $done = 0;
+    EV::now_update();
     my $t = EV::timer($timeout, 0, sub {
         return if $done;
         $done = 1;
@@ -1601,6 +1606,7 @@ sub shutdown {
     # drains synchronously, and arming after would strand a no-op
     # timer that keeps the loop alive for the full grace period.
     if ($grace && $grace > 0) {
+        EV::now_update();
         $timer = EV::timer($grace, 0, sub {
             $err //= "Pool::shutdown timed out after ${grace}s";
             $finalize->();
@@ -2156,8 +2162,9 @@ to C<0>, which returns raw numeric forms for stable round-tripping.
 
 Return C<Date>, C<Date32>, C<DateTime>, and C<DateTime64> as formatted
 strings (e.g. C<"2024-01-15">, C<"2024-01-15 10:30:00">) instead of raw
-integers. Uses UTC; columns with an explicit timezone
-(C<DateTime('America/New_York')>) are converted to that zone.
+integers, in the column's timezone (C<DateTime('America/New_York')>),
+else the C<session_timezone> setting, else the server's timezone: the
+same wall time the server prints.
 
 =item decode_decimal => 0 | 1
 
@@ -2323,6 +2330,11 @@ C<undef> for a non-null column fails the whole batch with an
 encoding error instead of landing as a wrapped or zero value.
 Decimal and integer parsing matches the server's TSV verdicts
 (surplus fraction digits truncate; anything else malformed fails).
+The error names the column, the row (the 0-based index into C<$data>,
+or the 1-based line of TabSeparated text) and the offending value or
+nested element, e.g. C<column 'b' (UInt8), row 2: invalid value 'x'>.
+A value whose stringification dies (an overloaded object, a tied
+scalar) fails the batch the same way, with the exception text.
 
 Nested arrayrefs (Array/Tuple columns) and hashrefs (Map columns) are
 supported B<only on the native protocol>, where the encoder has the
@@ -2337,8 +2349,8 @@ protocol or pre-serialise nested types into ClickHouse TSV literal form.
     ], sub { ... });
 
 The optional C<\%settings> hashref works exactly as in L</query>,
-including C<query_id>, C<query_timeout>, and C<params>. Two extra
-flags are recognised here:
+including C<query_id>, C<query_timeout>, and C<params>. Extra
+options recognised here:
 
 =over 4
 
@@ -2353,6 +2365,49 @@ values are a no-op.
 Enables ClickHouse server-side insert batching by setting
 C<async_insert=1, wait_for_async_insert=0>. Both sub-settings can be
 overridden by passing them explicitly.
+
+=item C<empty_as_default =E<gt> 1>
+
+Native protocol only. Empty top-level values (C<undef> and C<''>) fall
+back to the column C<DEFAULT> when the default expression is a constant
+literal, or to the type default (C<0>, C<''>, C<[]>, epoch zero, zero
+UUID, ...) when no C<DEFAULT> is declared. C<undef> in C<Nullable>
+columns stays C<NULL>. Non-literal defaults (C<now()>, column
+references, function calls) and C<MATERIALIZED>/C<ALIAS>/C<EPHEMERAL>
+columns named in the insert fail the batch; use
+C<data_format =E<gt> 'Native'> with C<input_format_null_as_default>
+(see below) for server-side defaults instead. Off by default; without
+it C<undef> outside C<Nullable> columns fails the batch as before.
+
+=item C<defaults =E<gt> \%hash>
+
+Native protocol only. Per-column overrides: C<{ col =E<gt> $value }>
+replaces empty values in that column with C<$value> (C<''> always,
+C<undef> unless the column is C<Nullable>), whatever the table
+C<DEFAULT> is. Implies C<empty_as_default> for the named columns only.
+
+=item C<data_format =E<gt> $format>
+
+C<$data> is one string already in ClickHouse input format C<$format>
+(C<Native>, C<CSV>, C<JSONEachRow>, C<Parquet>, ...), parsed by the
+server as is. On the native protocol it travels inline with the query
+in one round trip, so C<compress> does not apply to it. A C<Native>
+block from L<ClickHouse::Encoder> declaring C<Nullable(T)> columns,
+with C<input_format_null_as_default =E<gt> 1>, makes the server fill
+the column C<DEFAULT> for each NULL:
+
+    $ch->insert('t (a, b)', $enc->encode(\@rows),
+        { data_format => 'Native', input_format_null_as_default => 1 },
+        sub { my (undef, $err) = @_; ... });
+
+=item C<columns_at =E<gt> \@positions>
+
+With arrayref data, column C<j> of the insert reads
+C<< $row->[$positions[j]] >>, so wider records need no per-row copy.
+Positions past the end of a row read as C<undef>. The number of
+positions must match the insert's columns.
+
+    $ch->insert('t (a, b, c)', \@records, { columns_at => [7, 2, 11] }, $cb);
 
 =back
 
@@ -3538,7 +3593,9 @@ C<eg/decimal_bigmath.pl>). Encode accepts decimal text or raw 32 LE bytes.
 
 Default: integer (days since epoch / Unix seconds). With C<decode_datetime>:
 C<YYYY-MM-DD> or C<YYYY-MM-DD HH:MM:SS> or C<YYYY-MM-DD HH:MM:SS.ffffff>.
-DateTime carries a timezone string; the formatted output uses it.
+Encode accepts the same integers or text. Text and formatted output are
+wall time in the column's timezone, else the C<session_timezone>
+setting, else the server's timezone, as the server reads and prints it.
 
 =item Time / Time64
 
