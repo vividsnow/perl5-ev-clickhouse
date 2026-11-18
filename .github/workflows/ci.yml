@@ -26,7 +26,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libssl-dev zlib1g-dev liblz4-dev pkg-config
+          sudo apt-get install -y -qq libssl-dev zlib1g-dev pkg-config
 
       - name: Install ClickHouse
         run: |
@@ -70,7 +70,7 @@ jobs:
       - name: Install system packages
         run: |
           apk add --no-cache perl perl-dev perl-app-cpanminus make gcc musl-dev \
-            openssl-dev zlib-dev lz4-dev pkgconf wget bash curl
+            openssl-dev zlib-dev pkgconf wget bash curl
 
       - name: Install ClickHouse
         run: |
@@ -103,7 +103,7 @@ jobs:
         with:
           usesh: true
           prepare: |
-            pkg install -y perl5 p5-EV openssl liblz4 pkgconf gmake bash curl
+            pkg install -y perl5 p5-EV openssl pkgconf gmake bash curl
           run: |
             # Install ClickHouse static binary (install script needs bash)
             curl -fsSL https://clickhouse.com/ | bash -s -- -y
@@ -132,7 +132,7 @@ jobs:
           perl-version: ${{ matrix.perl }}
 
       - name: Install system dependencies
-        run: brew install openssl@3 lz4 pkg-config
+        run: brew install openssl@3 pkg-config
 
       - name: Install ClickHouse
         run: |

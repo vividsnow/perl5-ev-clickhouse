@@ -11,7 +11,7 @@ my $RE_IDENT = qr/\A[A-Za-z_][A-Za-z0-9_]*\z/;
 my $RE_TABLE = qr/\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?\z/;
 
 BEGIN {
-    our $VERSION = '0.08';
+    our $VERSION = '0.09';
     use XSLoader;
     XSLoader::load __PACKAGE__, $VERSION;
 }
@@ -652,6 +652,169 @@ sub for_table {
                 : { name => $_->[0],    type => $_->[1] };
         } @{ $rows // [] };
         $cb->({ columns => \@cols });
+    });
+}
+
+# Functions ClickHouse marks non-deterministic (system.functions has no
+# such flag before 24.x, so the list is kept here): a DEFAULT calling one
+# is not a constant.
+my $RE_NONDET_FN = do {
+    my @names = qw(
+        UTCTimestamp UTC_timestamp DATABASE FQDN SCHEMA arrayJoin
+        arrayPartialReverseSort arrayPartialShuffle arrayPartialSort
+        arrayRandomSample arrayShuffle assignCentroid authUser
+        authenticatedUser blockNumber blockSerializedSize blockSize buildId
+        connectionId connection_id curdate currentDatabase currentHandler
+        currentProfiles currentQueryID currentRequestURL currentRoles
+        currentSchemas currentUser current_database current_date
+        current_query_id current_schema current_schemas current_setting
+        current_timestamp current_timezone current_user dateTimeToUUIDv7
+        defaultProfiles defaultRoles displayName dumpColumnStructure
+        enabledProfiles enabledRoles file filesystemAvailable
+        filesystemCapacity filesystemUnreserved
+        financialNetPresentValueExtended fullHostName fuzzBits
+        generateRandomStructure generateSerialID generateSnowflakeID
+        generateULID generateUUIDv4 generateUUIDv7 getMacro
+        getMergeTreeSetting getOSKernelVersion getServerPort
+        getServerSetting getSetting getSettingOrDefault hasColumnInTable
+        hostName hostname initialQueryID initialQueryStartTime
+        initial_query_id initial_query_start_time isConstant joinGet
+        joinGetOrNull localtime localtimestamp lowCardinalityIndices
+        lowCardinalityKeys now now64 nowInBlock nowInBlock64 obfuscateQuery
+        pgGetUserById pg_get_userbyid queryID query_id revision
+        rowNumberInAllBlocks rowNumberInBlock runningConcurrency
+        serverTimeZone serverTimezone serverUUID session_user shardCount
+        shardNum showCertificate tcpPort timeZone timezone today
+        toColumnTypeName transactionID unnest uptime user uuid version
+        yesterday zookeeperSessionUptime neighbor url aiClassify aiExtract
+        aiFilter aiGenerate aiRedact aiTranslate
+    );
+    my $alt = join '|', map { quotemeta } @names;
+    qr/(?<![\w.])(?:$alt|rand\w*|dictGet\w*|dictHas|dictIsIn|timeSeries\w*
+        |naiveBayes\w*|running\w+)\s*\(/xi;
+};
+
+# A backquoted identifier's name: ClickHouse escapes decoded.
+sub _unbackquote {
+    my ($s) = @_;
+    return $s unless $s =~ s/\A`(.*)`\z/$1/s;
+    my %esc = (b => "\b", f => "\f", r => "\r", n => "\n", t => "\t",
+               0 => "\0", a => "\a", v => "\x0b", e => "\e");
+    $s =~ s/\\(?:x([0-9A-Fa-f]{2})|(.))/
+        defined $1 ? chr(hex $1) : exists $esc{$2} ? $esc{$2} : $2/gse;
+    return $s;
+}
+
+# 1 when a DEFAULT expression references no column and calls nothing
+# non-deterministic.
+sub _constant_default {
+    my ($expr, $cols) = @_;
+    (my $code = $expr) =~ s/'(?:[^'\\]|\\.|'')*'/''/gs;
+    return 0 if $code =~ $RE_NONDET_FN;
+    while ($code =~ /(`(?:[^`\\]|\\.)*`)|\b([A-Za-z_]\w*)\b(?!\s*\()/g) {
+        return 0 if $cols->{ defined $1 ? _unbackquote($1) : $2 };
+    }
+    return 1;
+}
+
+# $ch->table_defaults('db.t', sub { my ($defaults, $err) = @_ })
+# Constant DEFAULTs evaluated by the server, as { column => value } for
+# insert(..., { defaults => $defaults }).
+sub table_defaults {
+    my ($self, $table, $cb) = @_;
+    die "Usage: \$ch->table_defaults(\$table, \$cb)"
+        unless defined $table && ref($cb) eq 'CODE';
+    my $part = qr/`(?:[^`\\]|\\.)+`|[A-Za-z_][A-Za-z0-9_]*/;
+    my ($db, $name) = $table =~ /\A(?:($part)\.)?($part)\z/
+        or die "table_defaults: invalid table name '$table'";
+    $db = _unbackquote($db) if defined $db;
+    $name = _unbackquote($name);
+    my $http = !$self->server_revision;
+    # string literals, not query parameters: a parameter value is parsed
+    # as escaped text, so a tab in a name would end it
+    my $lit = sub { "'" . ($_[0] =~ s/([\\'])/\\$1/gr) . "'" };
+    my $sql = "select name, type, default_kind, default_expression"
+            . " from system.columns where database = "
+            . (defined $db ? $lit->($db) : 'currentDatabase()')
+            . " and table = " . $lit->($name) . " order by position";
+    $sql .= " format TabSeparated" if $http;
+    $self->query($sql, sub {
+        my ($rows, $err) = @_;
+        return $cb->(undef, $err) if $err;
+        my @cols = map {
+            ref $_ eq 'HASH'
+                ? [ @$_{qw(name type default_kind default_expression)} ]
+                : $_
+        } @{ $rows // [] };
+        return $cb->(undef, "table_defaults: no table '$table'") unless @cols;
+        my %is_col = map { $_->[0] => 1 } @cols;
+        my @want = grep {
+            ($_->[2] // '') eq 'DEFAULT' && length($_->[3] // '')
+            && $_->[1] !~ /\A(?:Map|Nested|JSON|Object|Variant|Dynamic)\b/
+            && _constant_default($_->[3], \%is_col)
+        } @cols;
+        my %out;
+        my $value = sub {
+            my ($col, $v) = @_;
+            return $v unless defined $v && $col->[1] =~ /\A(?:Array|Tuple)\(/;
+            my @lit = EV::ClickHouse::_literal_value($v);
+            return @lit ? $lit[0] : ();
+        };
+        my $expr = sub {
+            my ($col) = @_;
+            # Not cast((expr) as T): older servers read ((1, 'a')) as a
+            # tuple of a tuple.
+            my $e = "CAST($col->[3], '" . ($col->[1] =~ s/([\\'])/\\$1/gr) . "')";
+            $e = "toUInt8($e)"
+                if $col->[1] =~ /\A(?:Nullable\(|LowCardinality\()*Bool\b/;
+            return "toString($e)";
+        };
+        # query() croaks synchronously once the connection is gone
+        my $ask = sub {
+            my ($sql, $done) = @_;
+            $sql .= " format TabSeparated" if $http;
+            eval { $self->query($sql, $done); 1 } or $done->(undef, $@ || 'query failed');
+        };
+        my ($one, $evaluated, $last_err) = (undef, 0);
+        $one = sub {
+            my ($i) = @_;
+            if ($i >= @want) {
+                undef $one;
+                return $evaluated ? $cb->(\%out) : $cb->(undef, $last_err);
+            }
+            $ask->("select " . $expr->($want[$i]), sub {
+                my ($r, $e) = @_;
+                if (!$e && $r && @$r) {
+                    my $row = $r->[0];
+                    my ($v) = ref $row eq 'HASH' ? values %$row : @$row;
+                    my @v = $value->($want[$i], $v);
+                    $out{ $want[$i][0] } = $v[0] if @v;
+                    $evaluated++;
+                } else {
+                    $last_err = $e // 'empty result';
+                }
+                $one->($i + 1);
+            });
+        };
+        unless (@want) {
+            undef $one;
+            return $cb->(\%out);
+        }
+        $ask->("select "
+            . join(', ', map { $expr->($want[$_]) . " as c$_" } 0 .. $#want), sub {
+            my ($r, $e) = @_;
+            # One failing expression fails the whole select: evaluate one
+            # at a time, keeping those that work; all failing is an error.
+            return $one->(0) if $e || !$r || !@$r;
+            my $row = $r->[0];
+            my @vals = ref $row eq 'HASH' ? @$row{ map { "c$_" } 0 .. $#want } : @$row;
+            for my $i (0 .. $#want) {
+                my @v = $value->($want[$i], $vals[$i]);
+                $out{ $want[$i][0] } = $v[0] if @v;
+            }
+            undef $one;
+            $cb->(\%out);
+        });
     });
 }
 
@@ -1320,6 +1483,7 @@ sub insert { shift->_dispatch(insert => @_) }
 sub ping   { shift->_dispatch(ping   => @_) }
 
 sub for_table       { shift->_dispatch(for_table => @_) }
+sub table_defaults  { shift->_dispatch(table_defaults => @_) }
 sub iterate         { shift->_pick->iterate(@_) }
 sub insert_streamer { shift->_pick->insert_streamer(@_) }
 
@@ -1805,9 +1969,9 @@ EV::ClickHouse - Async ClickHouse client using EV
 EV::ClickHouse is an asynchronous ClickHouse client that integrates with
 the L<EV> event loop. It speaks both the ClickHouse HTTP protocol
 (port 8123) and the native TCP protocol (port 9000) directly in XS, with
-no external ClickHouse client library linked. zlib is required; OpenSSL
-(for TLS) and liblz4 (for native compression) are optional and detected
-at build time.
+no external ClickHouse client library linked. zlib is required; LZ4
+(for native compression) is bundled. OpenSSL (for TLS) is optional
+and auto-detected at build time.
 
 Loading the module sets SIGPIPE to ignored when the process left it at
 its default, so a reset peer surfaces as ordinary EPIPE errors instead
@@ -2017,11 +2181,11 @@ B<Options:>
 =item compress => 0 | 1
 
 Enable compression: gzip on HTTP (request and response), LZ4 with CityHash
-checksums on the native protocol. Default: C<0>. Native compression
-requires liblz4 at build time. With native compression the client pins
-C<network_compression_method=LZ4> on every query unless you set that
-setting yourself, so servers whose default is ZSTD stay readable
-(ZSTD responses are rejected loudly, never misdecoded).
+checksums on the native protocol. Default: C<0>. LZ4 is bundled, so
+native compression is always available. With native compression the
+client pins C<network_compression_method=LZ4> on every query unless
+you set that setting yourself, so servers whose default is ZSTD stay
+readable (ZSTD responses are rejected loudly, never misdecoded).
 
 =item session_id => $id
 
@@ -2370,14 +2534,16 @@ overridden by passing them explicitly.
 
 Native protocol only. Empty top-level values (C<undef> and C<''>) fall
 back to the column C<DEFAULT> when the default expression is a constant
-literal, or to the type default (C<0>, C<''>, C<[]>, epoch zero, zero
+literal (also in the C<CAST(literal, 'Type')> and C<literal::Type>
+forms), or to the type default (C<0>, C<''>, C<[]>, epoch zero, zero
 UUID, ...) when no C<DEFAULT> is declared. C<undef> in C<Nullable>
-columns stays C<NULL>. Non-literal defaults (C<now()>, column
-references, function calls) and C<MATERIALIZED>/C<ALIAS>/C<EPHEMERAL>
-columns named in the insert fail the batch; use
-C<data_format =E<gt> 'Native'> with C<input_format_null_as_default>
-(see below) for server-side defaults instead. Off by default; without
-it C<undef> outside C<Nullable> columns fails the batch as before.
+columns stays C<NULL>. An empty value that needs any other default
+(C<now()>, column references, function calls, or a
+C<MATERIALIZED>/C<ALIAS>/C<EPHEMERAL> column) fails the batch; use
+L</table_defaults>, or C<data_format =E<gt> 'Native'> with
+C<input_format_null_as_default> (see below), for those. Off by
+default; without it C<undef> outside C<Nullable> columns fails the
+batch as before.
 
 =item C<defaults =E<gt> \%hash>
 
@@ -2390,15 +2556,27 @@ C<DEFAULT> is. Implies C<empty_as_default> for the named columns only.
 
 C<$data> is one string already in ClickHouse input format C<$format>
 (C<Native>, C<CSV>, C<JSONEachRow>, C<Parquet>, ...), parsed by the
-server as is. On the native protocol it travels inline with the query
-in one round trip, so C<compress> does not apply to it. A C<Native>
-block from L<ClickHouse::Encoder> declaring C<Nullable(T)> columns,
-with C<input_format_null_as_default =E<gt> 1>, makes the server fill
-the column C<DEFAULT> for each NULL:
+server's input format as is: over HTTP as the request body (gzipped
+with C<compress>), on the native protocol inline with the query in one
+round trip, uncompressed, the whole body held in memory on both sides.
+C<columns_at>, C<empty_as_default> and C<defaults> do not apply. A
+C<Native> block from L<ClickHouse::Encoder> declaring C<Nullable(T)>
+columns, with C<input_format_null_as_default =E<gt> 1>, makes the
+server fill the column C<DEFAULT> for each NULL (with C<async_insert>
+this needs ClickHouse 24.12 or later):
 
     $ch->insert('t (a, b)', $enc->encode(\@rows),
         { data_format => 'Native', input_format_null_as_default => 1 },
         sub { my (undef, $err) = @_; ... });
+
+=item C<data_block =E<gt> 1>
+
+With C<data_format =E<gt> 'Native'> on the native protocol, send the
+block as protocol Data instead, compressed when C<compress> is on.
+Its columns must match the insert's names and the table's types
+(C<String> may stand for C<LowCardinality(String)>); a mismatch fails
+the insert, since this path stores a NULL as the type's zero rather
+than the column C<DEFAULT>.
 
 =item C<columns_at =E<gt> \@positions>
 
@@ -2610,6 +2788,25 @@ so C<server_supports> returns false on HTTP for any feature. Unknown
 feature names also return false. Use C<server_revision> directly if you
 need the raw integer.
 
+=head2 features
+
+    my $f = EV::ClickHouse->features;  # or $ch->features
+    if ($f->{lz4}) { ... }
+
+Build capabilities as a hashref, callable on the class or on a
+connection. C<lz4> is 1 (LZ4 is bundled); C<tls> is 1 when built
+with OpenSSL, 0 otherwise.
+
+=head2 has_lz4
+
+Same as C<< EV::ClickHouse->features->{lz4} >>, on the class
+or on a connection.
+
+=head2 has_tls
+
+Same as C<< EV::ClickHouse->features->{tls} >>, on the class
+or on a connection.
+
 =head2 for_table
 
     $ch->for_table('events', sub {
@@ -2625,6 +2822,20 @@ C<{ columns =E<gt> [{name=E<gt>..., type=E<gt>...}, ...] }> to the
 callback. Useful for generic insert pipelines that need column types
 without hard-coding them. C<$name> may be C<table> or C<db.table>;
 non-identifier characters are rejected up-front.
+
+=head2 table_defaults
+
+    $ch->table_defaults('db.t', sub { my ($defaults, $err) = @_ });
+    $ch->insert('db.t', \@rows, { defaults => $defaults }, $cb);
+
+Reads the table's columns from C<system.columns> and has the server
+evaluate every constant C<DEFAULT> (cast to the column type), delivering
+C<{ column =E<gt> value }> for the C<defaults> insert option. Defaults
+that reference other columns or call a non-deterministic function
+(C<now()>, C<rand()>, ...), defaults the server cannot evaluate, and
+C<Map>/C<JSON>-typed columns are left out; it is an error only when
+every evaluation fails. Table and database names may be quoted
+with backticks; without a database, the current one is used.
 
 =head2 iterate
 
@@ -3283,7 +3494,8 @@ ProfileInfo packet on the native protocol, or from C<X-ClickHouse-Summary>
 
 =item * OpenSSL (optional, for TLS; auto-detected at build time)
 
-=item * liblz4 (optional, for native protocol compression; auto-detected)
+LZ4 (for native protocol compression) is bundled with the
+distribution; no system library is needed.
 
 =back
 

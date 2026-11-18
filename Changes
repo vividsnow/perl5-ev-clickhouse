@@ -1,3 +1,8 @@
+0.09  2026-11-18
+    - Faster DateTime text and float decimals; LZ4 bundled; features() reports build options.
+    - empty_as_default fails only rows that need it, accepts CAST defaults; new table_defaults.
+    - data_block sends a Native body compressed; fix query parameters with tabs or backslashes.
+
 0.08  2026-11-18
     - Fix nested LowCardinality; tz-less DateTime text uses the session/server timezone, not UTC.
     - Insert: enum labels, exponent decimals, IPv4 in IPv6; data_format, columns_at, defaults.

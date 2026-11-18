@@ -173,7 +173,7 @@ q_("drop table $t");
         [ 'truncated description', $head, qr/cannot parse the server's column description/ ],
         [ 'malformed column line', "$head" . "b UInt64\n", qr/cannot parse the server's column description/ ],
         [ 'hex DEFAULT past 64 bits', "$head`b` UInt64\tDEFAULT\t0x10000000000000001\n",
-          qr/column 'b' \(UInt64\): no client-side default/ ],
+          qr/column 'b' \(UInt64\), row 0: no client-side default/ ],
         [ 'hex DEFAULT in range', "$head`b` UInt64\tDEFAULT\t0xffffffffffffffff\n", undef ],
     ) {
         my ($name, $desc, $want) = @$case;

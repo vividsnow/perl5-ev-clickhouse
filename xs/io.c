@@ -959,6 +959,7 @@ static int pipeline_advance(ev_clickhouse_t *self) {
         if (send->insert_data) {
             self->insert_data = send->insert_data;
             self->insert_data_len = send->insert_data_len;
+            self->insert_native_body = send->insert_native_body;
             send->insert_data = NULL;
         }
         if (send->insert_av) {

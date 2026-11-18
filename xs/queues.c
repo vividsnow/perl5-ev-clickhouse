@@ -64,6 +64,7 @@ static ev_ch_send_t* alloc_send(void) {
     s->insert_data_len = 0;
     s->insert_av = NULL;
     s->insert_empty_as_default = 0;
+    s->insert_native_body = 0;
     s->insert_defaults = NULL;
     s->raw = 0;
     s->on_data = NULL;

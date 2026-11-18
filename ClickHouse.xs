@@ -19,7 +19,11 @@
 #define CH_MAX_DECOMPRESS_SIZE (128 * 1024 * 1024)  /* 128 MB safety limit */
 
 #ifdef HAVE_LZ4
-#include <lz4.h>
+/* Bundled LZ4, compiled separately in lz4_unit.c. */
+#if defined(__GNUC__) && __GNUC__ >= 4
+#  define LZ4LIB_VISIBILITY __attribute__ ((visibility ("hidden")))
+#endif
+#include "xs/lz4.h"
 #include "cityhash.h"
 
 #define CH_LZ4_METHOD     0x82
@@ -184,8 +188,10 @@ struct ev_clickhouse_s {
     SV *insert_av;              /* snapshot_insert_av() of an arrayref INSERT */
     char *insert_err;           /* deferred error from unsupported INSERT encoding */
     int insert_empty_as_default;/* empty cells fall back to column DEFAULT */
+    int insert_native_body;     /* insert_data is a Native block, sent as Data */
     HV *insert_defaults;        /* per-column caller defaults (owned) */
     tc_cols_t *insert_tc;       /* parsed TableColumns for pending INSERT */
+    struct ch_tz_s *zones;      /* time zones loaded so far (immutable) */
 
     /* queues */
     ngx_queue_t cb_queue;
@@ -300,6 +306,7 @@ struct ev_ch_send_s {
     size_t       insert_data_len;
     SV          *insert_av;      /* snapshot_insert_av() for native INSERT */
     int          insert_empty_as_default;
+    int          insert_native_body;
     HV          *insert_defaults;
     int          raw;            /* return raw response body */
     SV          *on_data;        /* per-query streaming callback */
@@ -397,6 +404,7 @@ static void capture_tls_error(ev_clickhouse_t *self);
 
 #include "xs/macros.h"
 #include "xs/queues.c"
+#include "xs/tzif.c"
 
 /* --- watcher helpers --- */
 
@@ -438,6 +446,7 @@ static void stop_timing(ev_clickhouse_t *self) {
 static int check_destroyed(ev_clickhouse_t *self) {
     if (self->magic == EV_CH_FREED && self->callback_depth == 0) {
         CLEAR_STR(self->recv_buf);
+        ch_tz_free(self->zones);
         Safefree(self);
         return 1;
     }
@@ -988,6 +997,25 @@ static int ch_tls_active(ev_clickhouse_t *self) {
 #endif
 }
 
+/* Build-time capabilities for features()/has_lz4()/has_tls().
+ * File scope: xsubpp mangles preprocessor conditionals inside
+ * braced XSUB bodies, so the XSUBs below call these instead. */
+static int ch_have_lz4(void) {
+#ifdef HAVE_LZ4
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static int ch_have_tls(void) {
+#ifdef HAVE_OPENSSL
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 static int cleanup_connection(ev_clickhouse_t *self, int reconnecting) {
     int was_connected = self->connected;
 
@@ -1356,26 +1384,42 @@ static void nbuf_ledouble(native_buf_t *b, double d) {
     nbuf_le64(b, v);
 }
 
-/* Write a parameter value as a Field::dump-format quoted string.
- * ClickHouse's Field::restoreFromDump for String parses a single-quoted token
- * with backslash escaping for ' and \. Without escaping, embedded single
- * quotes truncate the value silently. */
-static void nbuf_quoted_param(native_buf_t *b, const char *s, size_t len) {
-    size_t i, esc = 0;
-    for (i = 0; i < len; i++) if (s[i] == '\'' || s[i] == '\\') esc++;
-    nbuf_varuint(b, (uint64_t)(len + esc + 2));
-    nbuf_grow(b, len + esc + 2);
-    b->data[b->len++] = '\'';
-    if (esc == 0) {
-        memcpy(b->data + b->len, s, len);
-        b->len += len;
-    } else {
-        for (i = 0; i < len; i++) {
-            if (s[i] == '\'' || s[i] == '\\') b->data[b->len++] = '\\';
-            b->data[b->len++] = s[i];
+/* The server parses a parameter value as escaped text: write \, tab,
+ * newline, CR and NUL as escapes. Returns the length; out may be NULL. */
+static size_t param_text_escape(const char *s, size_t len, char *out) {
+    size_t i, n = 0;
+    for (i = 0; i < len; i++) {
+        char e = s[i] == '\\' ? '\\' : s[i] == '\t' ? 't' : s[i] == '\n' ? 'n'
+               : s[i] == '\r' ? 'r' : s[i] == '\0' ? '0' : 0;
+        if (e) {
+            if (out) { out[n] = '\\'; out[n + 1] = e; }
+            n += 2;
+        } else {
+            if (out) out[n] = s[i];
+            n++;
         }
     }
+    return n;
+}
+
+/* Write a parameter value as a Field::dump-format quoted string (escaped
+ * text, then backslash-escaped ' and \ inside single quotes). Without the
+ * quoting, embedded single quotes truncate the value silently. */
+static void nbuf_quoted_param(native_buf_t *b, const char *s, size_t len) {
+    size_t i, tlen = param_text_escape(s, len, NULL), esc = 0;
+    char *t;
+    Newx(t, tlen + 1, char);
+    param_text_escape(s, len, t);
+    for (i = 0; i < tlen; i++) if (t[i] == '\'' || t[i] == '\\') esc++;
+    nbuf_varuint(b, (uint64_t)(tlen + esc + 2));
+    nbuf_grow(b, tlen + esc + 2);
     b->data[b->len++] = '\'';
+    for (i = 0; i < tlen; i++) {
+        if (t[i] == '\'' || t[i] == '\\') b->data[b->len++] = '\\';
+        b->data[b->len++] = t[i];
+    }
+    b->data[b->len++] = '\'';
+    Safefree(t);
 }
 
 /* --- Native protocol read helpers (from recv_buf) --- */
@@ -1485,6 +1529,7 @@ static int is_client_only_key(const char *key, I32 klen) {
         || (klen == 8 && memcmp(key, "external", 8) == 0)
         || (klen == 10 && memcmp(key, "idempotent", 10) == 0)
         || (klen == 11 && memcmp(key, "data_format", 11) == 0)
+        || (klen == 10 && memcmp(key, "data_block", 10) == 0)
         || (klen == 10 && memcmp(key, "columns_at", 10) == 0)
         || (klen == 16 && memcmp(key, "empty_as_default", 16) == 0)
         || (klen == 8 && memcmp(key, "defaults", 8) == 0)
@@ -1495,8 +1540,19 @@ static int is_client_only_key(const char *key, I32 klen) {
 static void append_url_param(native_buf_t *b, const char *key, size_t klen,
                              const char *val, size_t vlen) {
     /* Guard the *3 arithmetic itself against size_t wraparound. */
-    if (klen > (SIZE_MAX - 64) / 3 || vlen > (SIZE_MAX - 64) / 3)
+    if (klen > (SIZE_MAX - 64) / 3 || vlen > (SIZE_MAX - 64) / 6)
         croak("URL parameter too large");
+    if (klen > 6 && memcmp(key, "param_", 6) == 0) {
+        size_t tlen = param_text_escape(val, vlen, NULL);
+        if (tlen != vlen) {
+            char *t;
+            Newx(t, tlen, char);
+            SAVEFREEPV(t);
+            param_text_escape(val, vlen, t);
+            val = t;
+            vlen = tlen;
+        }
+    }
     nbuf_grow(b, 2 + klen * 3 + vlen * 3);
     b->data[b->len++] = '&';
     b->len += url_encode(key, klen, b->data + b->len);
@@ -1716,6 +1772,20 @@ CODE:
     PERL_UNUSED_VAR(items);
 }
 
+void
+_literal_value(SV *text)
+PPCODE:
+{
+    /* A ClickHouse literal (as toString prints arrays and tuples) as a
+     * Perl value; the empty list when it is not one. */
+    STRLEN len;
+    const char *s = SvPV(text, len);
+    lit_t *l = parse_default_literal(s, len);
+    SV *v = l ? lit_to_sv(aTHX_ l) : NULL;
+    if (l) free_lit(l);
+    if (v) XPUSHs(sv_2mortal(v));
+}
+
 EV::ClickHouse
 _new(char *class, SV *loop_sv)
 CODE:
@@ -1787,6 +1857,7 @@ CODE:
         CLEAR_INSERT(self);
         free_insert_default_state(self);
         lc_free_dicts(self);
+        ch_tz_free(self->zones);
         Safefree(self);
         return;
     }
@@ -1833,6 +1904,7 @@ CODE:
 
     self->magic = EV_CH_FREED;
     if (self->callback_depth == 0) {
+        ch_tz_free(self->zones);
         Safefree(self);
     }
     /* else: check_destroyed() will Safefree when callback_depth reaches 0 */
@@ -2152,6 +2224,16 @@ CODE:
         }
     }
     data_format[data_format_len] = '\0';
+    int native_block = 0;
+    if (settings) {
+        SV **db = hv_fetchs(settings, "data_block", 0);
+        if (db) SvGETMAGIC(*db);
+        if (db && SvTRUE_nomg(*db)) {
+            if (data_format_len != 6 || memcmp(data_format, "Native", 6) != 0)
+                croak("data_block needs data_format => 'Native'");
+            native_block = self->protocol == PROTO_NATIVE;
+        }
+    }
 
     SSize_t ncols_at;
     SSize_t *cols_at = insert_columns_at(aTHX_ settings, &ncols_at);
@@ -2200,7 +2282,7 @@ CODE:
     }
 
     /* Native two-phase INSERT can only have one in flight at a time */
-    if (self->protocol == PROTO_NATIVE && !data_format_len
+    if (self->protocol == PROTO_NATIVE && (!data_format_len || native_block)
         && (self->insert_data || self->insert_av))
         croak("cannot pipeline native INSERT: previous INSERT still pending");
 
@@ -2223,7 +2305,7 @@ CODE:
     }
     const char *inline_data = NULL;
     STRLEN inline_len = 0;
-    if (self->protocol == PROTO_NATIVE && data_format_len)
+    if (self->protocol == PROTO_NATIVE && data_format_len && !native_block)
         inline_data = SvPV(data_sv, inline_len);
 
     /* Expand params => { x => 1 } to param_x => '1' AND idempotent => 1|$tok
@@ -2353,7 +2435,8 @@ CODE:
     /* For native INSERT, store data in the send entry (deferred to dispatch).
      * Even empty data needs the two-phase INSERT protocol to send an empty
      * DATA block. */
-    if (self->protocol == PROTO_NATIVE && !data_format_len) {
+    if (self->protocol == PROTO_NATIVE && (!data_format_len || native_block)) {
+        s->insert_native_body = native_block;
         if (data_is_av) {
             s->insert_av = SvREFCNT_inc(snap);
         } else {
@@ -2583,6 +2666,39 @@ server_revision(EV::ClickHouse self)
 CODE:
 {
     RETVAL = (UV)self->server_revision;
+}
+OUTPUT:
+    RETVAL
+
+SV *
+features(SV *thing)
+CODE:
+{
+    HV *h = newHV();
+    (void)hv_stores(h, "lz4", newSViv(ch_have_lz4()));
+    (void)hv_stores(h, "tls", newSViv(ch_have_tls()));
+    PERL_UNUSED_VAR(thing);
+    RETVAL = newRV_noinc((SV *)h);
+}
+OUTPUT:
+    RETVAL
+
+int
+has_lz4(SV *thing)
+CODE:
+{
+    PERL_UNUSED_VAR(thing);
+    RETVAL = ch_have_lz4();
+}
+OUTPUT:
+    RETVAL
+
+int
+has_tls(SV *thing)
+CODE:
+{
+    PERL_UNUSED_VAR(thing);
+    RETVAL = ch_have_tls();
 }
 OUTPUT:
     RETVAL

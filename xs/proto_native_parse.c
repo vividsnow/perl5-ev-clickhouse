@@ -538,7 +538,8 @@ static int parse_native_packet(ev_clickhouse_t *self, char **errmsg) {
                     }
                     ctypes[c] = parse_col_type(ctypes_str[c], ctype_lens[c]);
                     col_type_default_tz(ctypes[c],
-                        effective_tz(self, self->query_session_tz));
+                        effective_tz(self, self->query_session_tz),
+                        &self->zones);
 
                     /* custom serialization flag (revision >= 54446) */
                     if (dpos >= dlen) {
@@ -616,6 +617,11 @@ static int parse_native_packet(ev_clickhouse_t *self, char **errmsg) {
                                       || self->insert_defaults)) {
                     data_pkt = NULL;
                     data_pkt_len = (size_t)-1;
+                } else if (self->insert_native_body) {
+                    data_pkt = build_native_body_packet(self, self->insert_data,
+                        self->insert_data_len, cnames, cname_lens,
+                        ctypes_str, ctype_lens, (int)num_cols, &data_pkt_len,
+                        ibuf, sizeof(ibuf));
                 } else if (self->insert_av) {
                     data_pkt = build_native_insert_data_from_av_guarded(aTHX_ self,
                         self->insert_av,
@@ -857,7 +863,8 @@ static int parse_native_packet(ev_clickhouse_t *self, char **errmsg) {
 
                 col_types[c] = parse_col_type(ctype, ctype_len);
                 col_type_default_tz(col_types[c],
-                    effective_tz(self, self->query_session_tz));
+                    effective_tz(self, self->query_session_tz),
+                    &self->zones);
                 av_push(self->native_col_types, newSVpvn(ctype, ctype_len));
 
                 /* custom serialization flag (revision >= 54446) */
@@ -880,7 +887,16 @@ static int parse_native_packet(ev_clickhouse_t *self, char **errmsg) {
                     columns[c] = decode_column_ex(dbuf, dlen, &dpos, num_rows, col_types[c], &col_err, self->decode_flags, self, (int)c);
                     if (!columns[c]) {
                         if (col_err) {
-                            *errmsg = safe_strdup("decode_column failed");
+                            const char *bad_tz = col_type_zone_error(col_types[c]);
+                            if (bad_tz) {
+                                char zbuf[160];
+                                snprintf(zbuf, sizeof(zbuf), "unknown timezone "
+                                         "'%.60s' or missing timezone database",
+                                         bad_tz);
+                                *errmsg = safe_strdup(zbuf);
+                            } else {
+                                *errmsg = safe_strdup("decode_column failed");
+                            }
                             goto data_error;
                         }
                         goto data_need_more;

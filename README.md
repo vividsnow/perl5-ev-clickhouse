@@ -63,9 +63,9 @@ EV::ClickHouse - Async ClickHouse client using EV
 EV::ClickHouse is an asynchronous ClickHouse client that integrates with
 the [EV](https://metacpan.org/pod/EV) event loop. It speaks both the ClickHouse HTTP protocol
 (port 8123) and the native TCP protocol (port 9000) directly in XS, with
-no external ClickHouse client library linked. zlib is required; OpenSSL
-(for TLS) and liblz4 (for native compression) are optional and detected
-at build time.
+no external ClickHouse client library linked. zlib is required; LZ4
+(for native compression) is bundled. OpenSSL (for TLS) is optional
+and auto-detected at build time.
 
 Loading the module sets SIGPIPE to ignored when the process left it at
 its default, so a reset peer surfaces as ordinary EPIPE errors instead
@@ -251,11 +251,11 @@ mixes up responses - connect after forking instead.
 - compress => 0 | 1
 
     Enable compression: gzip on HTTP (request and response), LZ4 with CityHash
-    checksums on the native protocol. Default: `0`. Native compression
-    requires liblz4 at build time. With native compression the client pins
-    `network_compression_method=LZ4` on every query unless you set that
-    setting yourself, so servers whose default is ZSTD stay readable
-    (ZSTD responses are rejected loudly, never misdecoded).
+    checksums on the native protocol. Default: `0`. LZ4 is bundled, so
+    native compression is always available. With native compression the
+    client pins `network_compression_method=LZ4` on every query unless
+    you set that setting yourself, so servers whose default is ZSTD stay
+    readable (ZSTD responses are rejected loudly, never misdecoded).
 
 - session\_id => $id
 
@@ -581,14 +581,16 @@ options recognised here:
 
     Native protocol only. Empty top-level values (`undef` and `''`) fall
     back to the column `DEFAULT` when the default expression is a constant
-    literal, or to the type default (`0`, `''`, `[]`, epoch zero, zero
+    literal (also in the `CAST(literal, 'Type')` and `literal::Type`
+    forms), or to the type default (`0`, `''`, `[]`, epoch zero, zero
     UUID, ...) when no `DEFAULT` is declared. `undef` in `Nullable`
-    columns stays `NULL`. Non-literal defaults (`now()`, column
-    references, function calls) and `MATERIALIZED`/`ALIAS`/`EPHEMERAL`
-    columns named in the insert fail the batch; use
-    `data_format => 'Native'` with `input_format_null_as_default`
-    (see below) for server-side defaults instead. Off by default; without
-    it `undef` outside `Nullable` columns fails the batch as before.
+    columns stays `NULL`. An empty value that needs any other default
+    (`now()`, column references, function calls, or a
+    `MATERIALIZED`/`ALIAS`/`EPHEMERAL` column) fails the batch; use
+    ["table\_defaults"](#table_defaults), or `data_format => 'Native'` with
+    `input_format_null_as_default` (see below), for those. Off by
+    default; without it `undef` outside `Nullable` columns fails the
+    batch as before.
 
 - `defaults => \%hash`
 
@@ -601,15 +603,27 @@ options recognised here:
 
     `$data` is one string already in ClickHouse input format `$format`
     (`Native`, `CSV`, `JSONEachRow`, `Parquet`, ...), parsed by the
-    server as is. On the native protocol it travels inline with the query
-    in one round trip, so `compress` does not apply to it. A `Native`
-    block from [ClickHouse::Encoder](https://metacpan.org/pod/ClickHouse%3A%3AEncoder) declaring `Nullable(T)` columns,
-    with `input_format_null_as_default => 1`, makes the server fill
-    the column `DEFAULT` for each NULL:
+    server's input format as is: over HTTP as the request body (gzipped
+    with `compress`), on the native protocol inline with the query in one
+    round trip, uncompressed, the whole body held in memory on both sides.
+    `columns_at`, `empty_as_default` and `defaults` do not apply. A
+    `Native` block from [ClickHouse::Encoder](https://metacpan.org/pod/ClickHouse%3A%3AEncoder) declaring `Nullable(T)`
+    columns, with `input_format_null_as_default => 1`, makes the
+    server fill the column `DEFAULT` for each NULL (with `async_insert`
+    this needs ClickHouse 24.12 or later):
 
         $ch->insert('t (a, b)', $enc->encode(\@rows),
             { data_format => 'Native', input_format_null_as_default => 1 },
             sub { my (undef, $err) = @_; ... });
+
+- `data_block => 1`
+
+    With `data_format => 'Native'` on the native protocol, send the
+    block as protocol Data instead, compressed when `compress` is on.
+    Its columns must match the insert's names and the table's types
+    (`String` may stand for `LowCardinality(String)`); a mismatch fails
+    the insert, since this path stores a NULL as the type's zero rather
+    than the column `DEFAULT`.
 
 - `columns_at => \@positions`
 
@@ -813,6 +827,25 @@ so `server_supports` returns false on HTTP for any feature. Unknown
 feature names also return false. Use `server_revision` directly if you
 need the raw integer.
 
+## features
+
+    my $f = EV::ClickHouse->features;  # or $ch->features
+    if ($f->{lz4}) { ... }
+
+Build capabilities as a hashref, callable on the class or on a
+connection. `lz4` is 1 (LZ4 is bundled); `tls` is 1 when built
+with OpenSSL, 0 otherwise.
+
+## has\_lz4
+
+Same as `EV::ClickHouse->features->{lz4}`, on the class
+or on a connection.
+
+## has\_tls
+
+Same as `EV::ClickHouse->features->{tls}`, on the class
+or on a connection.
+
 ## for\_table
 
     $ch->for_table('events', sub {
@@ -828,6 +861,20 @@ Schema introspection: issues `describe table $name` and delivers
 callback. Useful for generic insert pipelines that need column types
 without hard-coding them. `$name` may be `table` or `db.table`;
 non-identifier characters are rejected up-front.
+
+## table\_defaults
+
+    $ch->table_defaults('db.t', sub { my ($defaults, $err) = @_ });
+    $ch->insert('db.t', \@rows, { defaults => $defaults }, $cb);
+
+Reads the table's columns from `system.columns` and has the server
+evaluate every constant `DEFAULT` (cast to the column type), delivering
+`{ column => value }` for the `defaults` insert option. Defaults
+that reference other columns or call a non-deterministic function
+(`now()`, `rand()`, ...), defaults the server cannot evaluate, and
+`Map`/`JSON`-typed columns are left out; it is an error only when
+every evaluation fails. Table and database names may be quoted
+with backticks; without a database, the current one is used.
 
 ## iterate
 
@@ -1476,7 +1523,9 @@ data. Connection-level accessors (`is_connected`, `server_info`,
 - [EV](https://metacpan.org/pod/EV) 4.11 or newer (event loop)
 - zlib (required)
 - OpenSSL (optional, for TLS; auto-detected at build time)
-- liblz4 (optional, for native protocol compression; auto-detected)
+
+    LZ4 (for native protocol compression) is bundled with the
+    distribution; no system library is needed.
 
 # TROUBLESHOOTING
 

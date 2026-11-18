@@ -344,7 +344,37 @@ struct col_type_s {
     char *type_str;       /* full type string (for Enum label lookup) */
     size_t type_str_len;
     char *tz;             /* timezone for DateTime/DateTime64 (NULL = UTC) */
+    ch_tz_t **zones;      /* zone cache to load tz from (NULL: process cache) */
+    const ch_tz_t *zone;  /* tz once loaded */
+    int zone_state;       /* 0 not loaded yet, 1 loaded, -1 failed */
 };
+
+static ch_tz_t *ch_tz_process_zones;
+
+/* The column's zone, loaded on first use; NULL for UTC and on failure
+ * (zone_state -1, see col_type_zone_error). */
+static const ch_tz_t *col_zone(col_type_t *t) {
+    if (!t->tz) return NULL;
+    if (!t->zone_state) {
+        char err[8];
+        t->zone = ch_tz_load(t->zones ? t->zones : &ch_tz_process_zones,
+                             t->tz, err, sizeof(err));
+        t->zone_state = t->zone ? 1 : -1;
+    }
+    return t->zone;
+}
+
+/* The tz of the first node whose zone failed to load, else NULL. */
+static const char *col_type_zone_error(const col_type_t *t) {
+    int i;
+    const char *e;
+    if (!t) return NULL;
+    if (t->zone_state < 0) return t->tz;
+    if ((e = col_type_zone_error(t->inner))) return e;
+    for (i = 0; i < t->num_inners; i++)
+        if ((e = col_type_zone_error(t->inners[i]))) return e;
+    return NULL;
+}
 
 static void free_col_type(col_type_t *t) {
     int i;
@@ -788,19 +818,46 @@ static col_type_t* parse_col_type(const char *type, size_t len) {
     return parse_col_type_depth(type, len, 0);
 }
 
-/* Give tz-less DateTime/DateTime64 nodes the session's timezone: the
- * server reads and renders their wall times in it. */
-static void col_type_default_tz(col_type_t *t, const char *tz) {
+/* Structurally equal types; a timezone missing on either side matches
+ * any (it means the session's). */
+static int col_type_same(const col_type_t *a, const col_type_t *b) {
     int i;
-    if (!t || !tz || !tz[0]) return;
-    if ((t->code == CT_DATETIME || t->code == CT_DATETIME64) && !t->tz) {
+    if (!a || !b) return a == b;
+    if (a->code != b->code || a->code == CT_UNKNOWN || a->param != b->param
+        || a->precision != b->precision || a->num_inners != b->num_inners)
+        return 0;
+    if (a->tz && b->tz && strcmp(a->tz, b->tz)) return 0;
+    if ((a->code == CT_ENUM8 || a->code == CT_ENUM16)
+        && (a->type_str_len != b->type_str_len
+            || memcmp(a->type_str, b->type_str, a->type_str_len)))
+        return 0;
+    if (!col_type_same(a->inner, b->inner)) return 0;
+    for (i = 0; i < a->num_inners; i++) {
+        if (!col_type_same(a->inners[i], b->inners[i])) return 0;
+        if (a->inner_names && b->inner_names
+            && strcmp(a->inner_names[i] ? a->inner_names[i] : "",
+                      b->inner_names[i] ? b->inner_names[i] : ""))
+            return 0;
+    }
+    return 1;
+}
+
+/* Give tz-less DateTime/DateTime64 nodes the session's timezone (the
+ * server reads and renders their wall times in it), and load zones from
+ * the connection's cache. */
+static void col_type_default_tz(col_type_t *t, const char *tz, ch_tz_t **zones) {
+    int i;
+    if (!t) return;
+    t->zones = zones;
+    if (tz && tz[0] && (t->code == CT_DATETIME || t->code == CT_DATETIME64)
+        && !t->tz) {
         size_t n = strlen(tz);
         Newx(t->tz, n + 1, char);
         Copy(tz, t->tz, n + 1, char);
     }
-    col_type_default_tz(t->inner, tz);
+    col_type_default_tz(t->inner, tz, zones);
     for (i = 0; i < t->num_inners; i++)
-        col_type_default_tz(t->inners[i], tz);
+        col_type_default_tz(t->inners[i], tz, zones);
 }
 
 static const char *hv_session_tz(pTHX_ HV *hv) {
@@ -845,42 +902,57 @@ static size_t col_type_fixed_size(col_type_t *t) {
 
 /* --- Decode helper functions for opt-in type formatting --- */
 
-/* Convert days since Unix epoch to "YYYY-MM-DD".
- * Cast to int64_t before multiply: 32-bit time_t platforms would otherwise
- * overflow for any date past 2038. */
+/* Proleptic Gregorian date of a day count since 1970-01-01, in int64
+ * (no time_t: 32-bit platforms would wrap past 2038). */
+static void civil_from_days(int64_t days, int64_t *y, int *m, int *d) {
+    int64_t era, yy;
+    unsigned doe, yoe, doy, mp;
+    days += 719468;
+    era = (days >= 0 ? days : days - 146096) / 146097;
+    doe = (unsigned)(days - era * 146097);
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    yy = (int64_t)yoe + era * 400;
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    mp = (5 * doy + 2) / 153;
+    *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+    *m = (int)(mp < 10 ? mp + 3 : mp - 9);
+    *y = yy + (*m <= 2);
+}
+
+/* "YYYY-MM-DD HH:MM:SS" of seconds since the epoch, into buf; length. */
+static int format_civil_secs(int64_t secs, char *buf, size_t sz) {
+    int64_t days = secs / 86400, rem = secs % 86400, y;
+    int m, d;
+    if (rem < 0) { rem += 86400; days--; }
+    civil_from_days(days, &y, &m, &d);
+    return snprintf(buf, sz, "%04lld-%02d-%02d %02d:%02d:%02d", (long long)y,
+                    m, d, (int)(rem / 3600), (int)(rem / 60 % 60), (int)(rem % 60));
+}
+
+/* Convert days since Unix epoch to "YYYY-MM-DD". */
 static SV* days_to_date_sv(int32_t days) {
-    time_t t = (time_t)((int64_t)days * 86400);
-    struct tm tm;
-    char buf[11];
-    if (!gmtime_r(&t, &tm)) return newSVpvn("0000-00-00", 10);
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-    return newSVpvn(buf, 10);
+    char buf[32];
+    int64_t y;
+    int m, d, n;
+    civil_from_days(days, &y, &m, &d);
+    n = snprintf(buf, sizeof(buf), "%04lld-%02d-%02d", (long long)y, m, d);
+    return newSVpvn(buf, n);
 }
 
-/* Convert epoch seconds to "YYYY-MM-DD HH:MM:SS" in UTC. */
-/* Format a UNIX epoch as "YYYY-MM-DD HH:MM:SS".  use_local=1 formats in the
- * caller's currently-active TZ (set via set_tz); otherwise UTC. */
-static SV* epoch_to_datetime_sv_ex(uint32_t epoch, int use_local) {
-    time_t t = (time_t)epoch;
-    struct tm tm;
-    char buf[20];
-    struct tm *r = use_local ? localtime_r(&t, &tm) : gmtime_r(&t, &tm);
-    if (!r) return newSVpvn("0000-00-00 00:00:00", 19);
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec);
-    return newSVpvn(buf, 19);
+/* Format a UNIX epoch as "YYYY-MM-DD HH:MM:SS" in zone (NULL = UTC). */
+static SV* epoch_to_datetime_sv_ex(uint32_t epoch, const ch_tz_t *zone) {
+    char buf[48];
+    int n = format_civil_secs((int64_t)epoch + ch_tz_offset(zone, epoch),
+                              buf, sizeof(buf));
+    return newSVpvn(buf, n);
 }
 
-/* Convert DateTime64 to "YYYY-MM-DD HH:MM:SS.fff...", use_local=1 for localtime */
-static SV* dt64_to_datetime_sv_ex(int64_t val, int precision, int use_local) {
+/* Convert DateTime64 to "YYYY-MM-DD HH:MM:SS.fff..." in zone (NULL = UTC) */
+static SV* dt64_to_datetime_sv_ex(int64_t val, int precision, const ch_tz_t *zone) {
     int64_t scale = 1;
     int p;
     int64_t epoch, frac;
-    time_t t;
-    struct tm tm;
-    char buf[32];
+    char buf[64];
     int n;
 
     for (p = 0; p < precision; p++) scale *= 10;
@@ -888,83 +960,27 @@ static SV* dt64_to_datetime_sv_ex(int64_t val, int precision, int use_local) {
     frac = val % scale;
     if (frac < 0) { epoch--; frac += scale; }
 
-    t = (time_t)epoch;
-    if (use_local) {
-        if (!localtime_r(&t, &tm)) return newSVpvn("0000-00-00 00:00:00", 19);
-    } else {
-        if (!gmtime_r(&t, &tm)) return newSVpvn("0000-00-00 00:00:00", 19);
-    }
-    n = snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
-                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                 tm.tm_hour, tm.tm_min, tm.tm_sec);
-    if (precision > 0 && n < 30) {
-        char fracbuf[16];
+    /* zone rules work in int years: beyond ~34000 years show UTC */
+    if (epoch > -((int64_t)1 << 40) && epoch < ((int64_t)1 << 40))
+        epoch += ch_tz_offset(zone, epoch);
+    n = format_civil_secs(epoch, buf, 40);
+    if (precision > 0) {
+        char fracbuf[24];
         int fi;
         snprintf(fracbuf, sizeof(fracbuf), "%0*lld", precision, (long long)frac);
         buf[n++] = '.';
-        for (fi = 0; fi < precision && n < 31; fi++)
+        for (fi = 0; fi < precision && n < 63; fi++)
             buf[n++] = fracbuf[fi];
     }
     return newSVpvn(buf, n);
 }
 
-/* Set TZ env var and tzset(); returns saved old TZ (caller frees).
- * Safe because EV is single-threaded and the set_tz / decode / restore_tz
- * window contains no Perl callback dispatch. */
-static char* set_tz(const char *tz) {
-    char *saved = safe_strdup(getenv("TZ"));
-    setenv("TZ", tz, 1);
-    tzset();
-    return saved;
-}
-
-static int tz_offset_at(int64_t t, int64_t *off) {
-    struct tm tm;
-    time_t tt = (time_t)t;
-    if ((int64_t)tt != t || !localtime_r(&tt, &tm)) return 0;
-    *off = (int64_t)tm.tm_gmtoff;
-    return 1;
-}
-
-/* Wall time given as seconds-as-if-UTC, read in the column tz (caller
- * holds set_tz across the column). Like the server: in a DST fold the
- * earlier instant, in a gap the offset in force after the transition. */
-static int64_t wall_in_tz_to_epoch(int64_t utc_wall, const char *tz, int *ok) {
-    int64_t off_before, off_after, chk, t1, t2;
-    int v1, v2;
-    *ok = 0;
-    if (!tz || !tz[0]) { *ok = 1; return utc_wall; }
-    if (!tz_offset_at(utc_wall - 86400, &off_before)
-        || !tz_offset_at(utc_wall + 86400, &off_after))
-        return 0;
-    t1 = utc_wall - off_before;
-    t2 = utc_wall - off_after;
-    v1 = tz_offset_at(t1, &chk) && t1 + chk == utc_wall;
-    v2 = tz_offset_at(t2, &chk) && t2 + chk == utc_wall;
-    *ok = 1;
-    if (v1 && v2) return t1 < t2 ? t1 : t2;
-    return v1 ? t1 : t2;
-}
-
-/* Restore TZ from saved value (which may be NULL), then free saved */
-static void restore_tz(char *saved) {
-    if (saved) {
-        setenv("TZ", saved, 1);
-        Safefree(saved);
-    } else {
-        unsetenv("TZ");
-    }
-    tzset();
-}
-
-static void restore_tz_dtor(pTHX_ void *saved) {
-    restore_tz((char *)saved);
-}
-
-/* set_tz() undone by the enclosing LEAVE, also when a croak in user code
- * (an overloaded value) unwinds past it. */
-static void set_tz_scoped(pTHX_ const char *tz) {
-    SAVEDESTRUCTOR_X(restore_tz_dtor, set_tz(tz));
+/* Wall time given as seconds-as-if-UTC, read in the column's zone; *ok
+ * is 0 when that zone cannot be loaded. */
+static int64_t wall_in_tz_to_epoch(int64_t utc_wall, col_type_t *ct, int *ok) {
+    const ch_tz_t *zone = col_zone(ct);
+    *ok = !(ct->tz && !zone);
+    return ch_tz_wall_to_epoch(zone, utc_wall);
 }
 
 /* Compute 10^n as double */
@@ -2043,16 +2059,17 @@ static SV** decode_column_data(const char *buf, size_t len, size_t *pos,
         return out;
     }
     if (fsz > 0) {
-        char *saved_tz = NULL;
-        int tz_set = 0;
+        const ch_tz_t *zone = NULL;
 
         if (*pos > len || nrows > (len - *pos) / fsz) goto fail;
 
-        /* Set timezone for DateTime/DateTime64 columns with explicit tz */
         if (ct->tz && (decode_flags & DECODE_DT_STR) &&
             (ct->code == CT_DATETIME || ct->code == CT_DATETIME64)) {
-            saved_tz = set_tz(ct->tz);
-            tz_set = 1;
+            zone = col_zone(ct);
+            if (!zone) {
+                if (decode_err) *decode_err = 1;
+                goto fail;
+            }
         }
 
         for (i = 0; i < nrows; i++) {
@@ -2102,7 +2119,7 @@ static SV** decode_column_data(const char *buf, size_t len, size_t *pos,
                 case CT_DATETIME: {
                     uint32_t v; memcpy(&v, p, 4);
                     if (decode_flags & DECODE_DT_STR)
-                        out[i] = epoch_to_datetime_sv_ex(v, tz_set);
+                        out[i] = epoch_to_datetime_sv_ex(v, zone);
                     else
                         out[i] = newSVuv(v);
                     break;
@@ -2110,7 +2127,7 @@ static SV** decode_column_data(const char *buf, size_t len, size_t *pos,
                 case CT_DATETIME64: {
                     int64_t v; memcpy(&v, p, 8);
                     if (decode_flags & DECODE_DT_STR)
-                        out[i] = dt64_to_datetime_sv_ex(v, ct->param, tz_set);
+                        out[i] = dt64_to_datetime_sv_ex(v, ct->param, zone);
                     else
                         out[i] = newSViv((IV)v);
                     break;
@@ -2234,7 +2251,6 @@ static SV** decode_column_data(const char *buf, size_t len, size_t *pos,
                     out[i] = newSVpvn(p, fsz); break;
             }
         }
-        if (tz_set) restore_tz(saved_tz);
         *pos += nrows * fsz;
         return out;
     }
@@ -2444,7 +2460,7 @@ static void lc_write_nullable_indices(native_buf_t *b, uint64_t nrows,
  * returns 0 with *ok = 0. Pre-1970 dates work: the day count is a floor,
  * so the fraction always adds. */
 static int64_t parse_datetime64_to_scaled(const char *s, size_t len, int precision,
-                                          const char *tz, int *ok) {
+                                          col_type_t *ct, int *ok) {
     int32_t days;
     int64_t total, v, scale = 1;
     int sc;
@@ -2454,9 +2470,9 @@ static int64_t parse_datetime64_to_scaled(const char *s, size_t len, int precisi
     if (len >= 19 && !valid_time_part(s)) return 0;
     days = date_string_to_days(s, 10);
     total = (int64_t)days * 86400 + parse_hms(s, len);
-    if (tz && tz[0]) {
+    if (ct->tz && ct->tz[0]) {
         int tok = 0;
-        total = wall_in_tz_to_epoch(total, tz, &tok);
+        total = wall_in_tz_to_epoch(total, ct, &tok);
         if (!tok) return 0;
     }
     for (sc = 0; sc < precision; sc++) scale *= 10;
@@ -3360,6 +3376,21 @@ static void nbuf_enum(native_buf_t *b, int type_code, int code) {
     }
 }
 
+/* The whole of s[0..len) as a number. Text values need not be
+ * NUL-terminated (substituted defaults are not), so strtod gets a copy. */
+static int text_to_double(const char *s, size_t len, int as_float, double *out) {
+    char buf[64], *p = buf, *endp;
+    int ok;
+    if (len == 0) return 0;
+    if (len >= sizeof(buf)) Newx(p, len + 1, char);
+    memcpy(p, s, len);
+    p[len] = '\0';
+    *out = as_float ? (double)strtof(p, &endp) : strtod(p, &endp);
+    ok = endp == p + len;
+    if (p != buf) Safefree(p);
+    return ok;
+}
+
 /*
  * Encode a column of text values into native binary format.
  * Returns 1 on success, 0 if type is unsupported (caller falls back to inline SQL).
@@ -3481,12 +3512,7 @@ static int encode_column_text(native_buf_t *b,
         return 1;
     }
     case CT_UINT32: case CT_DATETIME: {
-        char *saved_tz = NULL;
-        int tz_set = 0, rc = 1;
-        if (ct->code == CT_DATETIME && ct->tz) {
-            saved_tz = set_tz(ct->tz);
-            tz_set = 1;
-        }
+        int rc = 1;
         for (i = 0; i < nrows; i++) {
             uint32_t v;
             if (ct->code == CT_DATETIME && value_lens[i] >= 10
@@ -3499,9 +3525,9 @@ static int encode_column_text(native_buf_t *b,
                 days = date_string_to_days(values[i], 10);
                 total = (int64_t)days * 86400
                       + parse_hms(values[i], value_lens[i]);
-                if (tz_set) {
+                if (ct->tz) {
                     int tok = 0;
-                    total = wall_in_tz_to_epoch(total, ct->tz, &tok);
+                    total = wall_in_tz_to_epoch(total, ct, &tok);
                     if (!tok) { rc = 0; break; }
                 }
                 if (total < 0 || total > (int64_t)UINT32_MAX) { rc = 0; break; }
@@ -3515,7 +3541,6 @@ static int encode_column_text(native_buf_t *b,
             }
             nbuf_append(b, (const char *)&v, 4);
         }
-        if (tz_set) restore_tz(saved_tz);
         return rc;
     }
     case CT_UINT64: {
@@ -3529,39 +3554,30 @@ static int encode_column_text(native_buf_t *b,
     }
     case CT_FLOAT32: {
         for (i = 0; i < nrows; i++) {
-            char *endp;
+            double d;
             float v;
-            if (value_lens[i] == 0) return 0;
-            v = strtof(values[i], &endp);
-            if (endp != values[i] + value_lens[i]) return 0;
+            if (!text_to_double(values[i], value_lens[i], 1, &d)) return 0;
+            v = (float)d;
             nbuf_append(b, (const char *)&v, 4);
         }
         return 1;
     }
     case CT_FLOAT64: {
         for (i = 0; i < nrows; i++) {
-            char *endp;
             double v;
-            if (value_lens[i] == 0) return 0;
-            v = strtod(values[i], &endp);
-            if (endp != values[i] + value_lens[i]) return 0;
+            if (!text_to_double(values[i], value_lens[i], 0, &v)) return 0;
             nbuf_append(b, (const char *)&v, 8);
         }
         return 1;
     }
     case CT_DATETIME64: {
-        char *saved_tz = NULL;
-        int tz_set = 0, rc = 1;
-        if (ct->tz) {
-            saved_tz = set_tz(ct->tz);
-            tz_set = 1;
-        }
+        int rc = 1;
         for (i = 0; i < nrows; i++) {
             int64_t v;
             if (value_lens[i] >= 10 && values[i][4] == '-') {
                 int ok = 0;
                 v = parse_datetime64_to_scaled(values[i], value_lens[i],
-                                               ct->param, ct->tz, &ok);
+                                               ct->param, ct, &ok);
                 if (!ok) { rc = 0; break; }
             } else {
                 int ok = 0;
@@ -3570,7 +3586,6 @@ static int encode_column_text(native_buf_t *b,
             }
             nbuf_append(b, (const char *)&v, 8);
         }
-        if (tz_set) restore_tz(saved_tz);
         return rc;
     }
     case CT_TIME: {
@@ -3637,11 +3652,10 @@ static int encode_column_text(native_buf_t *b,
     }
     case CT_BFLOAT16: {
         for (i = 0; i < nrows; i++) {
-            char *endp;
+            double d;
             float fv;
-            if (value_lens[i] == 0) return 0;
-            fv = (float)strtod(values[i], &endp);
-            if (endp != values[i] + value_lens[i]) return 0;
+            if (!text_to_double(values[i], value_lens[i], 0, &d)) return 0;
+            fv = (float)d;
             uint8_t b32[4]; memcpy(b32, &fv, 4);
             nbuf_append(b, (const char *)&b32[2], 2);
         }
@@ -3810,6 +3824,225 @@ static int encode_column_text(native_buf_t *b,
 #define SV_PLAIN_NUM(sv) (!SvGMAGICAL(sv) && !SvPOK(sv) && !SvROK(sv) \
                           && (SvIOK(sv) || SvNOK(sv)))
 
+/* The text SvPV would give a plain number (same rules as sv_2pv: IV
+ * first, 0 for zeroes, Inf/NaN, %g at NV_DIG), written to buf instead of
+ * cached in the caller's scalar. buf holds SV_NUM_TEXT_MAX bytes. */
+#define SV_NUM_TEXT_MAX 64
+
+#if defined(__SIZEOF_INT128__) && NVSIZE == 8 && NV_DIG == 15
+#define HAVE_FAST_G15 1
+/* The 15 significant digits %.15g prints for 1e-13 <= |v| < 1e21: the
+ * exact binary value rounded half-even, as glibc does. v equals
+ * q * 10^(e10 - 14) after rounding, q in [10^14, 10^15). 0 = out of range. */
+static int g15_digits(double v, uint64_t *qp, int *e10p, int *negp) {
+    static const uint64_t p5[28] = {
+        1ULL, 5ULL, 25ULL, 125ULL, 625ULL, 3125ULL, 15625ULL, 78125ULL,
+        390625ULL, 1953125ULL, 9765625ULL, 48828125ULL, 244140625ULL,
+        1220703125ULL, 6103515625ULL, 30517578125ULL, 152587890625ULL,
+        762939453125ULL, 3814697265625ULL, 19073486328125ULL,
+        95367431640625ULL, 476837158203125ULL, 2384185791015625ULL,
+        11920928955078125ULL, 59604644775390625ULL, 298023223876953125ULL,
+        1490116119384765625ULL, 7450580596923828125ULL
+    };
+    const uint64_t lo15 = 100000000000000ULL, hi15 = 1000000000000000ULL;
+    uint64_t bits, mant, q;
+    int exp2, neg, e10, tries;
+    double a;
+    memcpy(&bits, &v, 8);
+    neg = (int)(bits >> 63);
+    exp2 = (int)((bits >> 52) & 0x7ff);
+    if (exp2 == 0 || exp2 == 0x7ff) return 0;
+    a = neg ? -v : v;
+    if (!(a >= 1e-13 && a < 1e21)) return 0;
+    mant = (bits & ((1ULL << 52) - 1)) | (1ULL << 52);
+    exp2 -= 1075;
+    /* floor(log10(a)) to within one, corrected below */
+    e10 = ((exp2 + 52) * 78913) >> 18;
+    /* Double arithmetic first: a * 10^k is off by at most 0.12 from the
+     * exact product, so it decides the rounding unless it lands near .5
+     * or a digit-count boundary. */
+    for (tries = 0; tries < 3; tries++) {
+        static const double p10d[23] = {
+            1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+            1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
+        };
+        int k = 14 - e10;
+        double y, f, r;
+        if (k < -22 || k > 22) break;
+        y = k >= 0 ? a * p10d[k] : a / p10d[-k];
+        if (y < 1e14) { e10--; continue; }
+        if (y >= 1e15) { e10++; continue; }
+        if (y < 1e14 + 1 || y > 1e15 - 2) break;
+        f = floor(y);
+        r = y - f;
+        if (r > 0.3 && r < 0.7) break;
+        *qp = (uint64_t)f + (r >= 0.7);
+        *e10p = e10;
+        *negp = neg;
+        return 1;
+    }
+    for (tries = 0; ; tries++) {
+        int k = 14 - e10, s, up;
+        unsigned __int128 n, r;
+        if (tries > 3 || k < -7 || k > 27) return 0;
+        if (k >= 0) {
+            n = (unsigned __int128)mant * p5[k];
+            s = k + exp2;
+            if (s >= 0) {
+                if (s > 10) return 0;
+                q = (uint64_t)(n << s);
+                up = 0;
+                if ((n << s) >> 64) return 0;
+            } else {
+                unsigned __int128 half;
+                if (-s > 120) return 0;
+                if ((n >> -s) >> 64) { e10++; continue; }
+                q = (uint64_t)(n >> -s);
+                r = n & ((((unsigned __int128)1) << -s) - 1);
+                half = ((unsigned __int128)1) << (-s - 1);
+                up = r > half || (r == half && (q & 1));
+            }
+        } else {
+            uint64_t d = p5[-k];
+            s = exp2 + k;
+            if (s < 0 || s > 60) return 0;
+            n = (unsigned __int128)mant << s;
+            if ((n / d) >> 64) { e10++; continue; }
+            q = (uint64_t)(n / d);
+            r = n % d;
+            up = 2 * r > d || (2 * r == d && (q & 1));
+        }
+        if (q >= hi15) { e10++; continue; }
+        if (q < lo15) { e10--; continue; }
+        if (up) q++;
+        if (q == hi15) { q = lo15; e10++; }
+        break;
+    }
+    *qp = q;
+    *e10p = e10;
+    *negp = neg;
+    return 1;
+}
+
+/* snprintf(buf, "%.15g", v) where g15_digits applies, else 0. */
+static int fast_g15(double v, char *buf) {
+    uint64_t q;
+    int e10, neg;
+    char dig[16], *p = buf;
+    if (!g15_digits(v, &q, &e10, &neg)) return 0;
+    {
+        int i, nd = 15;
+        uint32_t hi = (uint32_t)(q / 100000000), lo = (uint32_t)(q % 100000000);
+        for (i = 14; i >= 7; i--) { dig[i] = (char)('0' + lo % 10); lo /= 10; }
+        for (i = 6; i >= 0; i--) { dig[i] = (char)('0' + hi % 10); hi /= 10; }
+        while (nd > 1 && dig[nd - 1] == '0') nd--;
+        if (neg) *p++ = '-';
+        if (e10 < -4 || e10 >= 15) {
+            int x = e10 < 0 ? -e10 : e10;
+            *p++ = dig[0];
+            if (nd > 1) { *p++ = '.'; for (i = 1; i < nd; i++) *p++ = dig[i]; }
+            *p++ = 'e';
+            *p++ = e10 < 0 ? '-' : '+';
+            if (x >= 100) *p++ = (char)('0' + x / 100);
+            *p++ = (char)('0' + x / 10 % 10);
+            *p++ = (char)('0' + x % 10);
+        } else if (e10 >= 0) {
+            for (i = 0; i <= e10; i++) *p++ = i < 15 ? dig[i] : '0';
+            if (nd > e10 + 1) { *p++ = '.'; for (i = e10 + 1; i < nd; i++) *p++ = dig[i]; }
+        } else {
+            *p++ = '0';
+            *p++ = '.';
+            for (i = 0; i < -e10 - 1; i++) *p++ = '0';
+            for (i = 0; i < nd; i++) *p++ = dig[i];
+        }
+    }
+    *p = '\0';
+    return (int)(p - buf);
+}
+#endif
+
+static const char *sv_num_text(pTHX_ SV *sv, char *buf, STRLEN *len) {
+    NV nv;
+    int n;
+    if (SvIOK(sv)) {
+        n = SvIsUV(sv) ? snprintf(buf, SV_NUM_TEXT_MAX, "%" UVuf, SvUVX(sv))
+                       : snprintf(buf, SV_NUM_TEXT_MAX, "%" IVdf, SvIVX(sv));
+    } else {
+        nv = SvNVX(sv);
+        if (nv == 0.0 && !Perl_isnan(nv))
+            n = snprintf(buf, SV_NUM_TEXT_MAX, "0");
+        else if (Perl_isnan(nv))
+            n = snprintf(buf, SV_NUM_TEXT_MAX, "NaN");
+        else if (Perl_isinf(nv))
+            n = snprintf(buf, SV_NUM_TEXT_MAX, nv > 0 ? "Inf" : "-Inf");
+        else {
+#ifdef HAVE_FAST_G15
+            n = fast_g15((double)nv, buf);
+            if (!n)
+#endif
+            n = snprintf(buf, SV_NUM_TEXT_MAX, "%.*" NVgf, NV_DIG, nv);
+        }
+    }
+    *len = (STRLEN)n;
+    return buf;
+}
+
+/* SvPV(sv, len) without caching a string in a plain number. */
+#define SV_TEXT(sv, buf, len) \
+    (SV_PLAIN_NUM(sv) ? sv_num_text(aTHX_ (sv), (buf), &(len)) : SvPV((sv), (len)))
+
+/* parse_decimal_to_raw() of the text SvPV gives a plain number, computed
+ * from the number: 1 when done (*ok the verdict), 0 to parse the text. */
+static int num_decimal_raw(pTHX_ SV *sv, int scale, int precision,
+                           int64_t *raw, int *ok) {
+    static const uint64_t p10[19] = {
+        1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL,
+        10000000ULL, 100000000ULL, 1000000000ULL, 10000000000ULL,
+        100000000000ULL, 1000000000000ULL, 10000000000000ULL,
+        100000000000000ULL, 1000000000000000ULL, 10000000000000000ULL,
+        100000000000000000ULL, 1000000000000000000ULL
+    };
+    uint64_t mag, t;
+    int neg = 0, int_digits = 0;
+    *ok = 0;
+    if (!SV_PLAIN_NUM(sv) || scale < 0 || scale > 18
+        || precision < 1 || precision > 18)
+        return 0;
+    if (SvIOK(sv)) {
+        if (SvIsUV(sv)) {
+            mag = SvUVX(sv);
+        } else {
+            IV iv = SvIVX(sv);
+            neg = iv < 0;
+            mag = neg ? (uint64_t)0 - (uint64_t)iv : (uint64_t)iv;
+        }
+        for (t = mag; t; t /= 10) int_digits++;
+        if (int_digits > precision - scale) return 1;
+        mag *= p10[scale];
+    } else {
+#ifdef HAVE_FAST_G15
+        NV nv = SvNVX(sv);
+        uint64_t q;
+        int e10, sh;
+        if (nv == 0.0) {
+            *raw = 0;
+            *ok = 1;
+            return 1;
+        }
+        if (!g15_digits((double)nv, &q, &e10, &neg)) return 0;
+        int_digits = e10 >= 0 ? e10 + 1 : 0;
+        if (int_digits > precision - scale) return 1;
+        sh = e10 - 14 + scale;
+        mag = sh >= 0 ? q * p10[sh] : -sh > 18 ? 0 : q / p10[-sh];
+#else
+        return 0;
+#endif
+    }
+    *raw = neg ? -(int64_t)mag : (int64_t)mag;
+    *ok = 1;
+    return 1;
+}
+
 /*
  * Encode a column of Perl SV values into native binary format.
  * Like encode_column_text() but takes SVs directly — no TSV parsing/unescaping.
@@ -3819,6 +4052,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
                             SV **values, uint64_t nrows,
                             col_type_t *ct) {
     uint64_t i;
+    char nbuf_num[SV_NUM_TEXT_MAX];
 
     switch (ct->code) {
     case CT_INT8: {
@@ -3948,8 +4182,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
         return 1;
     }
     case CT_UINT32: case CT_DATETIME: {
-        int tz_set = 0, rc = 1;
-        ENTER;
+        int rc = 1;
         for (i = 0; i < nrows; i++) {
             uint32_t v;
             STRLEN vlen;
@@ -3960,18 +4193,14 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
             if (ct->code == CT_DATETIME && vlen >= 10 && s[4] == '-') {
                 int32_t days;
                 int64_t total;
-                if (ct->tz && !tz_set) {
-                    set_tz_scoped(aTHX_ ct->tz);
-                    tz_set = 1;
-                }
                 if (vlen != 10 && vlen != 19) { rc = 0; break; }
                 if (!valid_date_prefix(s, vlen)) { rc = 0; break; }
                 if (vlen >= 19 && !valid_time_part(s)) { rc = 0; break; }
                 days = date_string_to_days(s, 10);
                 total = (int64_t)days * 86400 + parse_hms(s, vlen);
-                if (tz_set) {
+                if (ct->tz) {
                     int tok = 0;
-                    total = wall_in_tz_to_epoch(total, ct->tz, &tok);
+                    total = wall_in_tz_to_epoch(total, ct, &tok);
                     if (!tok) { rc = 0; break; }
                 }
                 if (total < 0 || total > (int64_t)UINT32_MAX) { rc = 0; break; }
@@ -3984,7 +4213,6 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
             }
             nbuf_append(b, (const char *)&v, 4);
         }
-        LEAVE;
         return rc;
     }
     case CT_UINT64: {
@@ -4004,7 +4232,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
                 v = (float)SvNV(values[i]);
             } else {
                 STRLEN vlen;
-                const char *s = SvPV(values[i], vlen);
+                const char *s = SV_TEXT(values[i], nbuf_num, vlen);
                 char *endp;
                 if (vlen == 0) return 0;
                 v = strtof(s, &endp);
@@ -4022,7 +4250,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
                 v = SvNV(values[i]);
             } else {
                 STRLEN vlen;
-                const char *s = SvPV(values[i], vlen);
+                const char *s = SV_TEXT(values[i], nbuf_num, vlen);
                 char *endp;
                 if (vlen == 0) return 0;
                 v = strtod(s, &endp);
@@ -4033,8 +4261,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
         return 1;
     }
     case CT_DATETIME64: {
-        int tz_set = 0, rc = 1;
-        ENTER;
+        int rc = 1;
         for (i = 0; i < nrows; i++) {
             int64_t v;
             if (!SvOK(values[i])) { rc = 0; break; }
@@ -4042,15 +4269,10 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
                 v = (int64_t)SvIV(values[i]);
             } else {
                 STRLEN vlen;
-                const char *s = SvPV(values[i], vlen);
+                const char *s = SV_TEXT(values[i], nbuf_num, vlen);
                 if (vlen >= 10 && s[4] == '-') {
                     int ok = 0;
-                    if (ct->tz && !tz_set) {
-                        set_tz_scoped(aTHX_ ct->tz);
-                        tz_set = 1;
-                    }
-                    v = parse_datetime64_to_scaled(s, vlen, ct->param,
-                                                   ct->tz, &ok);
+                    v = parse_datetime64_to_scaled(s, vlen, ct->param, ct, &ok);
                     if (!ok) { rc = 0; break; }
                 } else {
                     int ok = 0;
@@ -4060,7 +4282,6 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
             }
             nbuf_append(b, (const char *)&v, 8);
         }
-        LEAVE;
         return rc;
     }
     case CT_TIME: {
@@ -4072,7 +4293,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
                 v = (int64_t)SvIV(values[i]);
             } else {
                 STRLEN vlen;
-                const char *s = SvPV(values[i], vlen);
+                const char *s = SV_TEXT(values[i], nbuf_num, vlen);
                 int ok = 0;
                 v = parse_time_text(s, vlen, 0, &ok);
                 if (!ok) {
@@ -4094,7 +4315,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
                 v = (int64_t)SvIV(values[i]);
             } else {
                 STRLEN vlen;
-                const char *s = SvPV(values[i], vlen);
+                const char *s = SV_TEXT(values[i], nbuf_num, vlen);
                 int ok = 0;
                 v = parse_time_text(s, vlen, ct->param, &ok);
                 if (!ok) {
@@ -4112,10 +4333,15 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
             const char *s;
             int ok = 0;
             int32_t v;
+            int64_t raw;
             if (!SvOK(values[i])) return 0;
-            s = SvPV(values[i], vlen);
-            v = (int32_t)parse_decimal_to_raw(s, vlen, ct->param,
-                                              ct->precision, &ok);
+            if (!num_decimal_raw(aTHX_ values[i], ct->param, ct->precision,
+                                 &raw, &ok)) {
+                s = SV_TEXT(values[i], nbuf_num, vlen);
+                raw = parse_decimal_to_raw(s, vlen, ct->param,
+                                           ct->precision, &ok);
+            }
+            v = (int32_t)raw;
             if (!ok) return 0;
             nbuf_append(b, (const char *)&v, 4);
         }
@@ -4128,8 +4354,11 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
             int ok = 0;
             int64_t v;
             if (!SvOK(values[i])) return 0;
-            s = SvPV(values[i], vlen);
-            v = parse_decimal_to_raw(s, vlen, ct->param, ct->precision, &ok);
+            if (!num_decimal_raw(aTHX_ values[i], ct->param, ct->precision,
+                                 &v, &ok)) {
+                s = SV_TEXT(values[i], nbuf_num, vlen);
+                v = parse_decimal_to_raw(s, vlen, ct->param, ct->precision, &ok);
+            }
             if (!ok) return 0;
             nbuf_append(b, (const char *)&v, 8);
         }
@@ -4141,7 +4370,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
             const char *s;
             unsigned char raw[16];
             if (!SvOK(values[i])) return 0;
-            s = SvPV(values[i], vlen);
+            s = SV_TEXT(values[i], nbuf_num, vlen);
             if (!parse_decimal128_to_raw(s, vlen, ct->param, ct->precision,
                                          raw))
                 return 0;
@@ -4159,7 +4388,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
             const char *s;
             unsigned char raw[32];
             if (!SvOK(values[i])) return 0;
-            s = SvPV(values[i], slen);
+            s = SV_TEXT(values[i], nbuf_num, slen);
             if (parse_decimal256_to_raw(s, slen, ct->param, ct->precision, raw)) {
                 nbuf_append(b, (const char *)raw, 32);
             } else if (slen == 32) {
@@ -4185,7 +4414,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
                 fv = (float)SvNV(values[i]);
             } else {
                 STRLEN vlen;
-                const char *s = SvPV(values[i], vlen);
+                const char *s = SV_TEXT(values[i], nbuf_num, vlen);
                 char *endp;
                 if (vlen == 0) return 0;
                 fv = (float)strtod(s, &endp);
@@ -4202,7 +4431,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
             STRLEN vlen;
             const char *v;
             if (!SvOK(values[i])) return 0;
-            v = SvPV(values[i], vlen);
+            v = SV_TEXT(values[i], nbuf_num, vlen);
             nbuf_string(b, v, vlen);
         }
         return 1;
@@ -4213,7 +4442,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
             STRLEN vlen;
             const char *v;
             if (!SvOK(values[i])) return 0;
-            v = SvPV(values[i], vlen);
+            v = SV_TEXT(values[i], nbuf_num, vlen);
             if ((size_t)vlen > fsz) return 0;
             nbuf_grow(b, fsz);
             memcpy(b->data + b->len, v, vlen);
@@ -4229,7 +4458,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
             STRLEN slen;
             const char *s;
             if (!SvOK(values[i])) return 0;
-            s = SvPV(values[i], slen);
+            s = SV_TEXT(values[i], nbuf_num, slen);
             if (!parse_uuid_to_le_bytes(s, slen, ubytes)) return 0;
             nbuf_append(b, (const char *)ubytes, 16);
         }
@@ -4242,7 +4471,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
             uint32_t v;
             int ok = 0;
             if (!SvOK(values[i])) return 0;
-            s = SvPV(values[i], vlen);
+            s = SV_TEXT(values[i], nbuf_num, vlen);
             v = parse_ipv4_to_u32(s, (size_t)vlen, &ok);
             if (!ok) return 0;
             nbuf_append(b, (const char *)&v, 4);
@@ -4255,7 +4484,7 @@ static int encode_column_sv(pTHX_ native_buf_t *b,
             STRLEN vlen;
             const char *s;
             if (!SvOK(values[i])) return 0;
-            s = SvPV(values[i], vlen);
+            s = SV_TEXT(values[i], nbuf_num, vlen);
             if (!parse_ipv6_to_bytes(s, (size_t)vlen, addr)) return 0;
             nbuf_append(b, (const char *)addr, 16);
         }
@@ -4813,6 +5042,7 @@ typedef struct {
     SV *subst_sv;       /* arrayref-path value, owned */
     char *subst_text;   /* string-path cell, owned */
     size_t subst_text_len;
+    char *err;          /* why an empty value here cannot be filled, owned */
 } col_default_t;
 
 /* ClickHouse string unescape shared by the wire and literal levels:
@@ -4885,6 +5115,7 @@ static void free_col_defaults(col_default_t *cdefs, int ncols) {
     for (i = 0; i < ncols; i++) {
         if (cdefs[i].subst_sv) SvREFCNT_dec(cdefs[i].subst_sv);
         Safefree(cdefs[i].subst_text);
+        Safefree(cdefs[i].err);
     }
     Safefree(cdefs);
 }
@@ -4996,10 +5227,12 @@ struct lit_s {
     char *str; size_t str_len;
     int boolean;
     lit_t **items; size_t nitems; size_t nicap;
+    col_type_t *cast;     /* CAST / :: target type, NULL when none */
 };
 
 static void free_lit(lit_t *l) {
     if (!l) return;
+    if (l->cast) free_col_type(l->cast);
     if (l->kind == L_STR) Safefree(l->str);
     if (l->items) {
         size_t i;
@@ -5034,7 +5267,106 @@ static int lit_push(lit_t *l, lit_t *item) {
     return 1;
 }
 
+/* Past a type name ("Decimal(9, 2)", "DateTime('UTC')"), else NULL. */
+static const char *skip_type_name(const char *p, const char *end) {
+    int depth = 0;
+    if (p >= end || !((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')
+                      || *p == '_'))
+        return NULL;
+    while (p < end && is_wordchar(*p)) p++;
+    p = skip_ws(p, end);
+    if (p >= end || *p != '(') return p;
+    for (; p < end; p++) {
+        if (*p == '\'') {
+            for (p++; p < end && *p != '\''; p++)
+                if (*p == '\\') p++;
+            if (p >= end) return NULL;
+        } else if (*p == '(') {
+            depth++;
+        } else if (*p == ')' && --depth == 0) {
+            return p + 1;
+        }
+    }
+    return NULL;
+}
+
+static lit_t *parse_lit_atom(const char **pp, const char *end, int depth);
+
+/* Record a cast on l; 0 when l already carries a different cast type
+ * (a cast of a cast is not a client-side literal). */
+static int lit_set_cast(lit_t *l, const char *type, size_t len) {
+    col_type_t *t = parse_col_type(type, len);
+    if (l->cast) {
+        int same = col_type_same(l->cast, t);
+        free_col_type(t);
+        return same;
+    }
+    l->cast = t;
+    return 1;
+}
+
+/* A literal, also in the constant forms ALTER writes: CAST(lit, 'Type'),
+ * CAST(lit AS Type), lit::Type. The cast type is kept: the literal only
+ * stands for the default when it matches the column (lit_casts_ok). */
 static lit_t *parse_lit(const char **pp, const char *end, int depth) {
+    const char *p = skip_ws(*pp, end);
+    lit_t *l;
+    if (p >= end || depth > 64) return NULL;
+    {
+        size_t kw = end - p > 5 && strncmp(p, "_CAST", 5) == 0 ? 5
+                  : end - p > 4 && strncasecmp(p, "CAST", 4) == 0 ? 4 : 0;
+        const char *q = kw && !is_wordchar(p[kw]) ? skip_ws(p + kw, end) : end;
+        if (q < end && *q == '(') {
+            q++;
+            l = parse_lit(&q, end, depth + 1);
+            if (!l) return NULL;
+            q = skip_ws(q, end);
+            if (q < end && *q == ',') {
+                lit_t *t;
+                int ok;
+                q++;
+                t = parse_lit(&q, end, depth + 1);
+                if (!t || t->kind != L_STR || t->cast) { free_lit(t); free_lit(l); return NULL; }
+                ok = lit_set_cast(l, t->str, t->str_len);
+                free_lit(t);
+                if (!ok) { free_lit(l); return NULL; }
+            } else if (end - q > 2 && strncasecmp(q, "AS", 2) == 0
+                       && !is_wordchar(q[2])) {
+                const char *ts = skip_ws(q + 2, end);
+                q = skip_type_name(ts, end);
+                if (!q || !lit_set_cast(l, ts, (size_t)(q - ts))) {
+                    free_lit(l);
+                    return NULL;
+                }
+            } else {
+                free_lit(l);
+                return NULL;
+            }
+            q = skip_ws(q, end);
+            if (q >= end || *q != ')') { free_lit(l); return NULL; }
+            p = q + 1;
+            goto suffix;
+        }
+    }
+    l = parse_lit_atom(&p, end, depth);
+    if (!l) return NULL;
+suffix:
+    for (;;) {
+        const char *ts, *q = skip_ws(p, end);
+        if (end - q < 2 || q[0] != ':' || q[1] != ':') break;
+        ts = skip_ws(q + 2, end);
+        q = skip_type_name(ts, end);
+        if (!q || !lit_set_cast(l, ts, (size_t)(q - ts))) {
+            free_lit(l);
+            return NULL;
+        }
+        p = q;
+    }
+    *pp = p;
+    return l;
+}
+
+static lit_t *parse_lit_atom(const char **pp, const char *end, int depth) {
     const char *p = skip_ws(*pp, end);
     lit_t *l;
     if (p >= end || depth > 64) return NULL;
@@ -5198,6 +5530,41 @@ static lit_t *parse_lit(const char **pp, const char *end, int depth) {
         return l;
     }
     return NULL;
+}
+
+static const col_type_t *strip_lc(const col_type_t *t) {
+    while (t && t->code == CT_LOWCARDINALITY) t = t->inner;
+    return t;
+}
+
+/* A CAST to the column's own type (LowCardinality aside, Nullable on the
+ * column side allowed) leaves the value to the column's encoder; any other
+ * target type converts on the server in ways the client does not mimic. */
+static int cast_matches(const col_type_t *cast, const col_type_t *col) {
+    cast = strip_lc(cast);
+    col = strip_lc(col);
+    if (col_type_same(cast, col)) return 1;
+    return col && col->code == CT_NULLABLE
+        && col_type_same(cast, strip_lc(col->inner));
+}
+
+/* 1 when every cast in the literal targets the type at its position in
+ * the column type. */
+static int lit_casts_ok(const lit_t *l, const col_type_t *ct) {
+    const col_type_t *t = strip_lc(ct);
+    size_t i;
+    if (l->cast && !cast_matches(l->cast, ct)) return 0;
+    if (t && t->code == CT_NULLABLE) t = strip_lc(t->inner);
+    for (i = 0; i < l->nitems; i++) {
+        const col_type_t *et = NULL;
+        if (l->kind == L_ARR && t && t->code == CT_ARRAY)
+            et = t->inner;
+        else if (l->kind == L_TUP && t && t->code == CT_TUPLE
+                 && i < (size_t)t->num_inners)
+            et = t->inners[i];
+        if (!lit_casts_ok(l->items[i], et)) return 0;
+    }
+    return 1;
 }
 
 /* A whole expression is a literal only if one value spans it. */
@@ -5490,13 +5857,13 @@ static col_default_t *resolve_insert_defaults(pTHX_ ev_clickhouse_t *self,
             snprintf(errbuf, errbuf_sz, "server did not send column "
                      "defaults for this insert: use data_format => "
                      "'Native' for server-side defaults");
-            goto fail;
+            goto col_fail;
         }
         if (self->insert_tc->bad) {
             snprintf(errbuf, errbuf_sz, "cannot parse the server's column "
                      "description: use data_format => 'Native' for "
                      "server-side defaults");
-            goto fail;
+            goto col_fail;
         }
         tc = find_tc_col(self->insert_tc, cnames[i], cname_lens[i]);
         if (!tc || !tc->kind) {
@@ -5518,72 +5885,55 @@ static col_default_t *resolve_insert_defaults(pTHX_ ev_clickhouse_t *self,
                 cd->subst_text_len = tl;
             }
             continue;
-        no_client_default:
-            {
-                char cn_tr[40], ct_tr[32];
-                resolve_err_trunc(cnames[i], cname_lens[i], cn_tr,
-                                  sizeof(cn_tr));
-                resolve_err_trunc(ctypes_str[i], ctype_lens[i], ct_tr,
-                                  sizeof(ct_tr));
-                snprintf(errbuf, errbuf_sz, "column '%s' (%s): no "
-                         "client-side default for empty values: use "
-                         "data_format => 'Native'", cn_tr, ct_tr);
-                goto fail;
-            }
         }
         if (tc->kind != 'D') {
-            char cn_tr[40], ct_tr[32];
             const char *kw = (tc->kind == 'M') ? "MATERIALIZED"
                            : (tc->kind == 'A') ? "ALIAS" : "EPHEMERAL";
-            resolve_err_trunc(cnames[i], cname_lens[i], cn_tr,
-                              sizeof(cn_tr));
-            resolve_err_trunc(ctypes_str[i], ctype_lens[i], ct_tr,
-                              sizeof(ct_tr));
             if (tc->expr && tc->expr_len) {
                 resolve_err_trunc(tc->expr, tc->expr_len, expr_tr,
                                   sizeof(expr_tr));
-                snprintf(errbuf, errbuf_sz, "column '%s' (%s): %s "
-                         "'%s': use data_format => 'Native' for "
-                         "server-side defaults", cn_tr, ct_tr,
-                         kw, expr_tr);
+                snprintf(errbuf, errbuf_sz, "%s '%s': use data_format => "
+                         "'Native' for server-side defaults", kw, expr_tr);
             } else {
-                snprintf(errbuf, errbuf_sz, "column '%s' (%s): %s "
-                         "column: use data_format => 'Native' for "
-                         "server-side defaults", cn_tr, ct_tr, kw);
+                snprintf(errbuf, errbuf_sz, "%s column: use data_format => "
+                         "'Native' for server-side defaults", kw);
             }
-            goto fail;
+            goto col_fail;
         }
         lit = parse_default_literal(tc->expr ? tc->expr : "",
                                     tc->expr ? tc->expr_len : 0);
+        if (lit && !lit_casts_ok(lit, ctypes[i])) {
+            free_lit(lit);
+            lit = NULL;
+        }
         if (!lit) {
-            char cn_tr[40], ct_tr[32];
-            resolve_err_trunc(cnames[i], cname_lens[i], cn_tr,
-                              sizeof(cn_tr));
-            resolve_err_trunc(ctypes_str[i], ctype_lens[i], ct_tr,
-                              sizeof(ct_tr));
             if (tc->expr && tc->expr_len)
                 resolve_err_trunc(tc->expr, tc->expr_len, expr_tr,
                                   sizeof(expr_tr));
             else
                 expr_tr[0] = '\0';
-            snprintf(errbuf, errbuf_sz, "column '%s' (%s): non-literal "
-                     "DEFAULT '%s': use data_format => 'Native' for "
-                     "server-side defaults", cn_tr, ct_tr, expr_tr);
-            goto fail;
+            snprintf(errbuf, errbuf_sz, "non-literal DEFAULT '%s': use "
+                     "data_format => 'Native' for server-side defaults",
+                     expr_tr);
+            goto col_fail;
         }
         if (!resolve_from_lit(aTHX_ cd, lit)) {
-            char cn_tr[40], ct_tr[32];
             free_lit(lit);
-            resolve_err_trunc(cnames[i], cname_lens[i], cn_tr,
-                              sizeof(cn_tr));
-            resolve_err_trunc(ctypes_str[i], ctype_lens[i], ct_tr,
-                              sizeof(ct_tr));
-            snprintf(errbuf, errbuf_sz, "column '%s' (%s): no "
-                     "client-side default for empty values: use "
-                     "data_format => 'Native'", cn_tr, ct_tr);
-            goto fail;
+            goto no_client_default;
         }
         free_lit(lit);
+        continue;
+    no_client_default:
+        snprintf(errbuf, errbuf_sz, "no client-side default for empty "
+                 "values: use data_format => 'Native'");
+    col_fail:
+        /* Fails the insert only when a value needs the substitution. */
+        {
+            size_t n = strlen(errbuf);
+            Newx(cd->err, n + 1, char);
+            Copy(errbuf, cd->err, n + 1, char);
+            errbuf[0] = '\0';
+        }
     }
     if (self->insert_defaults) {
         HE *he;
@@ -5654,6 +6004,12 @@ static void err_quote(native_buf_t *b, const char *s, size_t len) {
 
 static void err_append(native_buf_t *b, const char *s) {
     nbuf_append(b, s, strlen(s));
+}
+
+static void err_zone(native_buf_t *b, const char *tz) {
+    err_append(b, ": unknown timezone '");
+    nbuf_append(b, tz, strlen(tz) > 60 ? 60 : strlen(tz));
+    err_append(b, "' or missing timezone database");
 }
 
 /* A value as error text, without running overloads: undef, the type of a
@@ -5773,7 +6129,9 @@ static void describe_sv_failure(pTHX_ char *errbuf, size_t sz,
     nbuf_init(&msg);
     nbuf_init(&scratch);
     err_append(&msg, where);
-    if (!encode_column_sv(aTHX_ &scratch, vals, 0, ct)) {
+    if (col_type_zone_error(ct)) {
+        err_zone(&msg, col_type_zone_error(ct));
+    } else if (!encode_column_sv(aTHX_ &scratch, vals, 0, ct)) {
         err_append(&msg, ": unsupported type");
     } else {
         for (k = 0; k < n; k++)
@@ -5802,7 +6160,9 @@ static void describe_text_failure(char *errbuf, size_t sz, const char *where,
     nbuf_init(&msg);
     nbuf_init(&scratch);
     err_append(&msg, where);
-    if (!encode_column_text(&scratch, vals, lens, 0, ct)) {
+    if (col_type_zone_error(ct)) {
+        err_zone(&msg, col_type_zone_error(ct));
+    } else if (!encode_column_text(&scratch, vals, lens, 0, ct)) {
         err_append(&msg, ": unsupported type");
     } else {
         for (k = 0; k < n; k++) {
@@ -5901,6 +6261,180 @@ static col_default_t *resolve_insert_defaults_guarded(pTHX_ ev_clickhouse_t *sel
         return NULL;
     }
     return a.cdefs;
+}
+
+/* Skip one column's data (prefixes already consumed). 1 = ok, 0 = malformed,
+ * -1 = a type this walker does not know (caller decodes instead). */
+static int skip_column_data(const char *buf, size_t len, size_t *pos,
+                            uint64_t nrows, col_type_t *ct) {
+    size_t fsz;
+    uint64_t i;
+    int rc;
+    if (!ct) return -1;
+    if (*pos > len) return 0;
+    fsz = col_type_fixed_size(ct);
+    if (fsz) {
+        if (nrows > (len - *pos) / fsz) return 0;
+        *pos += nrows * fsz;
+        return 1;
+    }
+    switch (ct->code) {
+    case CT_STRING:
+        for (i = 0; i < nrows; i++)
+            if (skip_native_string(buf, len, pos) <= 0) return 0;
+        return 1;
+    case CT_NOTHING:
+        if (nrows > len - *pos) return 0;
+        *pos += nrows;
+        return 1;
+    case CT_NULLABLE:
+        if (nrows > len - *pos) return 0;
+        *pos += nrows;
+        return skip_column_data(buf, len, pos, nrows, ct->inner);
+    case CT_ARRAY:
+    case CT_MAP: {
+        uint64_t total = 0;
+        if (nrows > (len - *pos) / 8) return 0;
+        if (nrows) memcpy(&total, buf + *pos + (nrows - 1) * 8, 8);
+        *pos += nrows * 8;
+        if (ct->code == CT_ARRAY)
+            return skip_column_data(buf, len, pos, total, ct->inner);
+        if (ct->num_inners != 2) return -1;
+        if ((rc = skip_column_data(buf, len, pos, total, ct->inners[0])) <= 0)
+            return rc;
+        return skip_column_data(buf, len, pos, total, ct->inners[1]);
+    }
+    case CT_TUPLE:
+        for (i = 0; i < (uint64_t)ct->num_inners; i++)
+            if ((rc = skip_column_data(buf, len, pos, nrows, ct->inners[i])) <= 0)
+                return rc;
+        return 1;
+    case CT_LOWCARDINALITY: {
+        uint64_t ser_type, nkeys, nidx;
+        size_t idx_size;
+        col_type_t *dict_ct;
+        if (!nrows) return 1;
+        if (!ct->inner || len - *pos < 8) return !ct->inner ? -1 : 0;
+        memcpy(&ser_type, buf + *pos, 8);
+        *pos += 8;
+        /* One keys block follows HasAdditionalKeys and/or NeedUpdateDictionary. */
+        if ((ser_type & 0xFF) > 3 || !(ser_type & ((1ULL << 9) | (1ULL << 10))))
+            return 0;
+        idx_size = (size_t)1 << (ser_type & 0xFF);
+        dict_ct = ct->inner->code == CT_NULLABLE ? ct->inner->inner : ct->inner;
+        if (len - *pos < 8) return 0;
+        memcpy(&nkeys, buf + *pos, 8);
+        *pos += 8;
+        if ((rc = skip_column_data(buf, len, pos, nkeys, dict_ct)) <= 0) return rc;
+        if (len - *pos < 8) return 0;
+        memcpy(&nidx, buf + *pos, 8);
+        *pos += 8;
+        if (nidx != nrows || nidx > (len - *pos) / idx_size) return 0;
+        *pos += nidx * idx_size;
+        return 1;
+    }
+    default:
+        return -1;
+    }
+}
+
+/*
+ * Turn a Native-format block (as ClickHouse::Encoder or `format Native`
+ * writes it) into a protocol Data packet: BlockInfo first, and the
+ * custom-serialization byte after each column type. Returns NULL with
+ * errbuf set on a malformed block.
+ */
+/* The server's native reader converts String <-> LowCardinality(String)
+ * but turns other mismatches (a NULL for a non-Nullable column) into the
+ * type's zero rather than the column DEFAULT: insist on the table's types. */
+static int block_type_matches(const char *have, size_t have_len,
+                              const char *want, size_t want_len) {
+    if (have_len == want_len && memcmp(have, want, have_len) == 0) return 1;
+    if (want_len > 16 && memcmp(want, "LowCardinality(", 15) == 0
+        && want_len - 16 == have_len && memcmp(want + 15, have, have_len) == 0)
+        return 1;
+    return 0;
+}
+
+static char* build_native_body_packet(ev_clickhouse_t *self, const char *buf,
+                                      size_t len, const char **want_names,
+                                      size_t *want_name_lens,
+                                      const char **want_types,
+                                      size_t *want_type_lens, int want_cols,
+                                      size_t *out_len, char *errbuf,
+                                      size_t errbuf_sz) {
+    native_buf_t body;
+    uint64_t ncols, nrows, c;
+    size_t pos = 0;
+    nbuf_init(&body);
+    nbuf_block_info(&body);
+    if (read_varuint(buf, len, &pos, &ncols) <= 0
+        || read_varuint(buf, len, &pos, &nrows) <= 0)
+        goto bad;
+    if (ncols != (uint64_t)want_cols) {
+        snprintf(errbuf, errbuf_sz, "Native block has %llu columns, the insert %d",
+                 (unsigned long long)ncols, want_cols);
+        goto fail;
+    }
+    nbuf_varuint(&body, ncols);
+    nbuf_varuint(&body, nrows);
+    for (c = 0; c < ncols; c++) {
+        const char *name, *type;
+        size_t name_len, type_len, start;
+        col_type_t *ct;
+        int rc = 0;
+        if (read_native_string_ref(buf, len, &pos, &name, &name_len) <= 0
+            || read_native_string_ref(buf, len, &pos, &type, &type_len) <= 0)
+            goto bad;
+        if (name_len != want_name_lens[c] || memcmp(name, want_names[c], name_len)
+            || !block_type_matches(type, type_len, want_types[c], want_type_lens[c])) {
+            snprintf(errbuf, errbuf_sz, "Native block column %llu '%.*s' (%.*s) does "
+                     "not match the table's '%.*s' (%.*s); send it without data_block",
+                     (unsigned long long)c,
+                     (int)(name_len > 60 ? 60 : name_len), name,
+                     (int)(type_len > 60 ? 60 : type_len), type,
+                     (int)(want_name_lens[c] > 60 ? 60 : want_name_lens[c]), want_names[c],
+                     (int)(want_type_lens[c] > 60 ? 60 : want_type_lens[c]), want_types[c]);
+            goto fail;
+        }
+        nbuf_string(&body, name, name_len);
+        nbuf_string(&body, type, type_len);
+        nbuf_u8(&body, 0);
+        start = pos;
+        ct = parse_col_type(type, type_len);
+        if (ct && (!nrows || read_col_prefix(buf, len, &pos, ct) > 0))
+            rc = nrows ? skip_column_data(buf, len, &pos, nrows, ct) : 1;
+        if (ct && rc < 0) {
+            int derr = 0;
+            SV **vals;
+            pos = start;
+            vals = decode_column(buf, len, &pos, nrows, ct, &derr, 0);
+            if (vals) {
+                uint64_t i;
+                for (i = 0; i < nrows; i++) SvREFCNT_dec(vals[i]);
+                Safefree(vals);
+                rc = 1;
+            }
+        }
+        free_col_type(ct);
+        if (rc != 1) {
+            snprintf(errbuf, errbuf_sz, "malformed Native data in column '%.*s' (%.*s)",
+                     (int)(name_len > 60 ? 60 : name_len), name,
+                     (int)(type_len > 60 ? 60 : type_len), type);
+            Safefree(body.data);
+            *out_len = (size_t)-1;
+            return NULL;
+        }
+        nbuf_append(&body, buf + start, pos - start);
+    }
+    if (pos != len) goto bad;
+    return wrap_data_block(self, &body, out_len);
+bad:
+    snprintf(errbuf, errbuf_sz, "malformed Native data");
+fail:
+    Safefree(body.data);
+    *out_len = (size_t)-1;
+    return NULL;
 }
 
 /*
@@ -6025,18 +6559,19 @@ static char* build_native_insert_data(ev_clickhouse_t *self,
                         fp = cdefs[col].subst_text;
                         fl = cdefs[col].subst_text_len;
                     } else {
+                        char where[160];
+                        err_where(where, sizeof(where), col_names[col],
+                                  col_name_lens[col], col_types_str[col],
+                                  col_type_lens[col]);
+                        snprintf(errbuf, errbuf_sz, "%s, line %d: %s", where,
+                                 row + 1, cdefs[col].err ? cdefs[col].err
+                                 : "no client-side default for empty values: "
+                                   "use data_format => 'Native'");
                         Safefree(col_vals);
                         Safefree(col_vlens);
                         Safefree(body.data);
                         Safefree(fields);
                         Safefree(field_lens);
-                        snprintf(errbuf, errbuf_sz, "column '%.*s' "
-                                 "(%.*s): no client-side default for "
-                                 "empty values: use data_format => "
-                                 "'Native'",
-                                 (int)col_name_lens[col], col_names[col],
-                                 (int)col_type_lens[col],
-                                 col_types_str[col]);
                         *out_len = (size_t)-1;
                         return NULL;
                     }
@@ -6149,8 +6684,8 @@ static void enc_ctx_free(pTHX_ void *p) {
 /* Gather one column of n rows, with empty cells replaced by the column's
  * resolved default when cd asks for it: '' always, undef unless the
  * column is Nullable. */
-static void snap_gather(const insert_snap_t *sn, SSize_t r0, SSize_t n,
-                        int col, const col_default_t *cd, SV **vals) {
+static SSize_t snap_gather(const insert_snap_t *sn, SSize_t r0, SSize_t n,
+                           int col, const col_default_t *cd, SV **vals) {
     SSize_t k;
     SV *to;
     for (k = 0; k < n; k++) {
@@ -6158,14 +6693,16 @@ static void snap_gather(const insert_snap_t *sn, SSize_t r0, SSize_t n,
         SV *v = col < sn->off[r0 + k + 1] - o ? sn->cells[o + col] : NULL;
         vals[k] = v ? v : &PL_sv_undef;
     }
-    if (!cd || !cd->subst) return;
+    if (!cd || !cd->subst) return -1;
     to = cd->to_null ? &PL_sv_undef : cd->subst_sv;
-    if (!to) return;
     for (k = 0; k < n; k++) {
         SV *v = vals[k];
-        if (SvOK(v) ? SvPOK(v) && SvCUR(v) == 0 : !cd->nullable)
+        if (SvOK(v) ? SvPOK(v) && SvCUR(v) == 0 : !cd->nullable) {
+            if (!to) return cd->err ? k : -1;
             vals[k] = to;
+        }
     }
+    return -1;
 }
 
 /* Move one chunk's encoding of n rows (tmp) into the column's parts. */
@@ -6218,7 +6755,7 @@ static char* build_native_insert_data_from_av(pTHX_ ev_clickhouse_t *self,
     insert_snap_t *sn = insert_snap_get(aTHX_ snap_sv);
     SSize_t nrows = sn ? sn->nrows : 0;
     enc_ctx_t *x;
-    SSize_t r0, fail_r0 = 0, fail_n = 0;
+    SSize_t r0, fail_r0 = 0, fail_n = 0, fail_nodef = -1;
     int c, fail = num_cols;
     size_t need;
     char *pkt;
@@ -6270,8 +6807,13 @@ static char* build_native_insert_data_from_av(pTHX_ ev_clickhouse_t *self,
         for (c = 0; c < fail; c++) {
             enc_col_t *ec = &x->cols[c];
             int ok;
+            SSize_t nodef;
             if (ec->mode == ENC_WHOLE) continue;
-            snap_gather(sn, r0, n, c, cdefs ? &cdefs[c] : NULL, x->vals);
+            nodef = snap_gather(sn, r0, n, c, cdefs ? &cdefs[c] : NULL, x->vals);
+            if (nodef >= 0) {
+                fail = c; fail_r0 = r0; fail_n = n; fail_nodef = r0 + nodef;
+                break;
+            }
             prog->col = c; prog->r0 = r0; prog->n = n;
             if (ec->mode == ENC_PLAIN) {
                 ok = encode_column_sv(aTHX_ &ec->data, x->vals, (uint64_t)n,
@@ -6283,7 +6825,7 @@ static char* build_native_insert_data_from_av(pTHX_ ev_clickhouse_t *self,
                 if (ok) enc_split_chunk(ec, &x->tmp, n);
             }
             if (!ok) {
-                fail = c; fail_r0 = r0; fail_n = n;
+                fail = c; fail_r0 = r0; fail_n = n; fail_nodef = -1;
             }
             else if (r0 == 0 && n < nrows
                      && !(ec->mode == ENC_PLAIN && col_type_fixed_size(col_types[c])))
@@ -6294,12 +6836,15 @@ static char* build_native_insert_data_from_av(pTHX_ ev_clickhouse_t *self,
     }
     for (c = 0; c < fail; c++) {
         if (x->cols[c].mode != ENC_WHOLE) continue;
+        SSize_t nodef;
         ENTER; SAVETMPS;
-        snap_gather(sn, 0, nrows, c, cdefs ? &cdefs[c] : NULL, x->vals);
+        nodef = snap_gather(sn, 0, nrows, c, cdefs ? &cdefs[c] : NULL, x->vals);
         prog->col = c; prog->r0 = 0; prog->n = nrows;
-        if (!encode_column_sv(aTHX_ &x->cols[c].data, x->vals,
-                              (uint64_t)nrows, col_types[c])) {
-            fail = c; fail_r0 = 0; fail_n = nrows;
+        if (nodef >= 0) {
+            fail = c; fail_r0 = 0; fail_n = nrows; fail_nodef = nodef;
+        } else if (!encode_column_sv(aTHX_ &x->cols[c].data, x->vals,
+                                     (uint64_t)nrows, col_types[c])) {
+            fail = c; fail_r0 = 0; fail_n = nrows; fail_nodef = -1;
         }
         FREETMPS; LEAVE;
     }
@@ -6308,10 +6853,15 @@ static char* build_native_insert_data_from_av(pTHX_ ev_clickhouse_t *self,
         prog->col = fail; prog->r0 = fail_r0; prog->n = fail_n;
         err_where(where, sizeof(where), col_names[fail], col_name_lens[fail],
                   col_types_str[fail], col_type_lens[fail]);
-        snap_gather(sn, fail_r0, fail_n, fail, cdefs ? &cdefs[fail] : NULL,
-                    x->vals);
-        describe_sv_failure(aTHX_ errbuf, errbuf_sz, where, col_types[fail],
-                            x->vals, fail_n, fail_r0, "row");
+        if (fail_nodef >= 0) {
+            snprintf(errbuf, errbuf_sz, "%s, row %ld: %s", where,
+                     (long)fail_nodef, cdefs[fail].err);
+        } else {
+            snap_gather(sn, fail_r0, fail_n, fail, cdefs ? &cdefs[fail] : NULL,
+                        x->vals);
+            describe_sv_failure(aTHX_ errbuf, errbuf_sz, where, col_types[fail],
+                                x->vals, fail_n, fail_r0, "row");
+        }
         *out_len = (size_t)-1;  /* sentinel: encode failure */
         LEAVE;
         return NULL;
@@ -6554,7 +7104,7 @@ static char* build_external_tables(pTHX_ ev_clickhouse_t *self, HV *external,
             nbuf_u8(&body, 0);   /* has_custom_serialization = false */
 
             ct = parse_col_type(ctype, ctl);
-            col_type_default_tz(ct, tz);
+            col_type_default_tz(ct, tz, &self->zones);
 
             /* gather this column's values from the row-major data */
             Newx(col_vals, nrows > 0 ? nrows : 1, SV *);
