@@ -26,7 +26,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libssl-dev zlib1g-dev pkg-config
+          sudo apt-get install -y -qq libssl-dev zlib1g-dev libzstd-dev pkg-config
 
       - name: Install ClickHouse
         run: |
@@ -42,8 +42,9 @@ jobs:
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
               "clickhouse-server=$VER" "clickhouse-client=$VER" "clickhouse-common-static=$VER"
           fi
-          sudo clickhouse-server --daemon
-          for i in $(seq 1 30); do clickhouse-client --query "select 1" 2>/dev/null && break || sleep 1; done
+          sudo -u clickhouse clickhouse-server --config-file=/etc/clickhouse-server/config.xml --daemon
+          for i in $(seq 1 60); do clickhouse-client --query "select 1" 2>/dev/null && break || sleep 1; done
+          clickhouse-client --query "select version()" || { sudo tail -50 /var/log/clickhouse-server/clickhouse-server.err.log; exit 1; }
 
       - name: Install Perl dependencies
         run: cpanm -n EV
@@ -70,13 +71,15 @@ jobs:
       - name: Install system packages
         run: |
           apk add --no-cache perl perl-dev perl-app-cpanminus make gcc musl-dev \
-            openssl-dev zlib-dev pkgconf wget bash curl
+            openssl-dev zlib-dev zstd-dev tzdata pkgconf wget bash curl
 
       - name: Install ClickHouse
         run: |
           curl https://clickhouse.com/ | sh
-          ./clickhouse server --daemon
-          for i in $(seq 1 30); do ./clickhouse client --query "SELECT 1" 2>/dev/null && break || sleep 1; done
+          mkdir -p /tmp/chdata
+          (cd /tmp/chdata && "$GITHUB_WORKSPACE/clickhouse" server > /tmp/ch-server.log 2>&1 &)
+          for i in $(seq 1 60); do ./clickhouse client --query "SELECT 1" 2>/dev/null && break || sleep 1; done
+          ./clickhouse client --query "select version()" || { tail -50 /tmp/ch-server.log; exit 1; }
 
       - name: Install Perl dependencies
         run: cpanm -n EV
@@ -103,12 +106,12 @@ jobs:
         with:
           usesh: true
           prepare: |
-            pkg install -y perl5 p5-EV openssl pkgconf gmake bash curl
+            pkg install -y perl5 p5-EV openssl zstd pkgconf gmake bash curl clickhouse
           run: |
-            # Install ClickHouse static binary (install script needs bash)
-            curl -fsSL https://clickhouse.com/ | bash -s -- -y
-            ./clickhouse server --daemon
-            for i in $(seq 1 30); do ./clickhouse client --query "SELECT 1" 2>/dev/null && break || sleep 1; done
+            mkdir -p /tmp/chdata
+            (cd /tmp/chdata && clickhouse server > /tmp/ch-server.log 2>&1 &)
+            for i in $(seq 1 60); do clickhouse client --query "SELECT 1" 2>/dev/null && break || sleep 1; done
+            clickhouse client --query "select version()" || { tail -50 /tmp/ch-server.log; exit 1; }
 
             export TEST_CLICKHOUSE_HOST=127.0.0.1
             export TEST_CLICKHOUSE_PORT=8123
@@ -132,13 +135,14 @@ jobs:
           perl-version: ${{ matrix.perl }}
 
       - name: Install system dependencies
-        run: brew install openssl@3 pkg-config
+        run: brew install openssl@3 zstd pkg-config
 
       - name: Install ClickHouse
         run: |
           curl https://clickhouse.com/ | sh
           ./clickhouse server --daemon
-          for i in $(seq 1 30); do ./clickhouse client --query "SELECT 1" 2>/dev/null && break || sleep 1; done
+          for i in $(seq 1 60); do ./clickhouse client --query "SELECT 1" 2>/dev/null && break || sleep 1; done
+          ./clickhouse client --query "select version()"
 
       - name: Install Perl dependencies
         run: cpanm -n EV

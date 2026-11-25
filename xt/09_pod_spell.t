@@ -279,3 +279,7 @@ dedupes
 liveness
 selectable
 ddl
+GiB
+codec
+libzstd
+lz
